@@ -11,6 +11,12 @@ futures = "0.3"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+# Position-aware Markdown parsing for the visual editor's source mapping
+# (GPUI Kit's parser keeps inline source segments private). Same version
+# GPUI Base already depends on, so no new code is compiled.
+markdown = "=1.0.0"
+# Grapheme boundaries for caret movement. Already in the tree via GPUI Base.
+unicode-segmentation = "1.13"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
