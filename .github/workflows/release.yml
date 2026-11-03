@@ -15,6 +15,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # gpui-base is patched from a pinned commit on this repository's
+  # gpui-base-fork branch; fetch it with git so the checkout's credentials
+  # apply when the repository is private.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   macos:
@@ -22,6 +26,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # Cargo fetches the pinned gpui-base fork from this repository; give
+      # its git the job's read-only token in case the repository is private.
+      - name: Credentials for the gpui-base fork
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -50,6 +59,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # Cargo fetches the pinned gpui-base fork from this repository; give
+      # its git the job's read-only token in case the repository is private.
+      - name: Credentials for the gpui-base fork
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -85,6 +99,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # Cargo fetches the pinned gpui-base fork from this repository; give
+      # its git the job's read-only token in case the repository is private.
+      - name: Credentials for the gpui-base fork
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
       - name: System libraries
         run: |
           sudo apt-get update
@@ -134,6 +153,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Cargo fetches the pinned gpui-base fork from this repository; give
+      # its git the job's read-only token in case the repository is private.
+      - name: Credentials for the gpui-base fork
+        shell: bash
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
       - uses: actions/download-artifact@v4
         with:
           path: dist
