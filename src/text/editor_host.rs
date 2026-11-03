@@ -160,6 +160,42 @@ impl RenderContext {
     }
 }
 
+impl Table {
+    /// The content width of each column, as rendering this table would
+    /// measure it (cached on the table). An editor that renders a long table
+    /// in slices measures the whole table once and hands the widths to every
+    /// slice, so the columns line up.
+    pub fn measure_column_widths(
+        &self,
+        render_context: &RenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<f32> {
+        let col_count = self
+            .children
+            .iter()
+            .map(|row| row.children.len())
+            .max()
+            .unwrap_or(0);
+        super::node::measure_table_columns(self, col_count, &render_context.node, window, cx)
+    }
+
+    /// Renders this table as one slice of a longer table: row 0 is a header
+    /// only when `header`; the frame's top and bottom borders and corners are
+    /// drawn only when `top` and `bottom`; columns take `widths` instead of
+    /// being measured. Use `FlowPosition::first`/`last` to drop the gaps
+    /// between slices.
+    pub fn chunk(mut self, header: bool, top: bool, bottom: bool, widths: Arc<Vec<f32>>) -> Self {
+        self.chunk = super::node::TableChunk {
+            header,
+            top,
+            bottom,
+            widths: Some(widths),
+        };
+        self
+    }
+}
+
 /// Where a block stands in the flow it is rendered in, which decides the gaps
 /// around it: the first block takes no gap above, the last none below, and a
 /// heading or rule counts the block before it.

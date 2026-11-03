@@ -27,3 +27,13 @@ computes, to evaluate driving enso's visual view from GPUI Kit's own parse:
 `SourceSegment` becomes public with `rendered()`, `source()` and `linear()`
 getters (fields stay private), plus `InlineNode::source_mapping()`,
 `CodeBlock::source_mapping()` and `ImageNode::span()`. No behaviour changes.
+
+## Tables rendered in slices (enso patch, approved non-read-only change)
+
+`Table::measure_column_widths` exposes the column measurement rendering
+already does (and caches). `Table::chunk(header, top, bottom, widths)` renders
+a table as one slice of a longer table: header styling only on the first
+slice, frame borders and corners only at the ends, fixed column widths so the
+slices line up. enso renders long tables as slices in a virtualized list, so
+a 400-row table no longer lays out every row on every frame. Additive; tables
+that never call `chunk` render exactly as before.

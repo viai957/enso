@@ -1995,6 +1995,35 @@ pub struct Table {
     /// frames; see [`Table::cached_table_data`].
     pub(crate) table_data_cache: TableDataCache,
     pub(crate) column_widths_cache: TableColumnWidthsCache,
+    /// How this table renders when it is one slice of a longer table (see
+    /// `Table::chunk`, enso patch).
+    pub(crate) chunk: TableChunk,
+}
+
+/// Rendering of a table that is one slice of a longer one, so an editor can
+/// render a long table in pieces that are laid out only when visible, with
+/// columns that line up across pieces.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TableChunk {
+    /// Row 0 is the header.
+    pub(crate) header: bool,
+    /// The frame's top border and corners are drawn.
+    pub(crate) top: bool,
+    /// The frame's bottom border and corners are drawn.
+    pub(crate) bottom: bool,
+    /// Fixed content widths per column, instead of measuring this slice.
+    pub(crate) widths: Option<Arc<Vec<f32>>>,
+}
+
+impl Default for TableChunk {
+    fn default() -> Self {
+        Self {
+            header: true,
+            top: true,
+            bottom: true,
+            widths: None,
+        }
+    }
 }
 
 /// Derived state, invisible to `Debug` and equality.
@@ -3360,7 +3389,7 @@ const CELL_BORDER_PX: f32 = 1.0; // border_r_1 drawn by every column but the las
 /// shaped with the runs the cell renders with, plus the cell's padding and
 /// border. Never capped: a cap would clip overflowing text *and* leave it
 /// outside the scrollable width, making it unreachable.
-fn measure_table_columns(
+pub(super) fn measure_table_columns(
     table: &Table,
     col_count: usize,
     node_cx: &NodeContext,
@@ -3970,7 +3999,14 @@ impl BlockNode {
             .map(|row| row.children.len())
             .max()
             .unwrap_or(0);
-        let col_w = measure_table_columns(table, col_count, node_cx, window, cx);
+        let col_w = match &table.chunk.widths {
+            Some(widths) => {
+                let mut w = widths.to_vec();
+                w.resize(col_count, CELL_MIN_PX);
+                w
+            }
+            None => measure_table_columns(table, col_count, node_cx, window, cx),
+        };
         let scroll = matches!(style.table().overflow.x, Some(Overflow::Scroll));
         let nowrap = style.table_cell().text.white_space == Some(WhiteSpace::Nowrap);
         let rem_size = window.rem_size();
@@ -4019,6 +4055,16 @@ impl BlockNode {
             .border_1()
             .border_color(style.border())
             .refine_style(style.table());
+        let frame = if table.chunk.top {
+            frame
+        } else {
+            frame.border_t_0().rounded_t_none()
+        };
+        let frame = if table.chunk.bottom {
+            frame
+        } else {
+            frame.border_b_0().rounded_b_none()
+        };
         let body = if scroll {
             let scroll_handle = window
                 .use_keyed_state(
@@ -4208,21 +4254,23 @@ impl BlockNode {
             rows.push(
                 div()
                     .w_full()
-                    .when(row_ix < row_count - 1, |this| this.border_b_1())
+                    .when(row_ix < row_count - 1 || !table.chunk.bottom, |this| {
+                        this.border_b_1()
+                    })
                     .border_color(style.border())
                     .flex()
                     .flex_row()
                     // The first row is the header, as everywhere else that
                     // reads a table (`table_data`, `to_markdown`). The
                     // refinement comes last so it can override the defaults.
-                    .when(row_ix == 0, |this| {
+                    .when(row_ix == 0 && table.chunk.header, |this| {
                         this.bg(style.code_background())
                             .text_color(style.foreground())
                             .when_some(top_left, |this, radius| this.rounded_tl(radius))
                             .when_some(top_right, |this, radius| this.rounded_tr(radius))
                             .refine_style(&style.table_head())
                     })
-                    .when(row_ix + 1 == row_count, |this| {
+                    .when(row_ix + 1 == row_count && table.chunk.bottom, |this| {
                         this.when_some(bottom_left, |this, radius| this.rounded_bl(radius))
                             .when_some(bottom_right, |this, radius| this.rounded_br(radius))
                     })
@@ -5029,6 +5077,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            chunk: TableChunk::default(),
         };
         let node_cx = NodeContext::default();
 
@@ -5616,6 +5665,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            chunk: TableChunk::default(),
         };
         let block = BlockNode::Table(table);
         assert_eq!(
@@ -5665,6 +5715,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            chunk: TableChunk::default(),
         }
     }
 
