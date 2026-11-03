@@ -11,7 +11,7 @@
 
 ## Run
 
-Install stable Rust (1.95 or later). GPUI Kit comes from crates.io (`gpui-kit = "0.8.1"`), so a plain clone builds on its own.
+Install stable Rust. `rust-toolchain.toml` pins the exact version (1.97.0), so rustup fetches it on first build and rustfmt output matches everywhere. GPUI Kit comes from crates.io (`gpui-kit = "0.8.1"`), so a plain clone builds on its own.
 
 ```sh
 cargo run
