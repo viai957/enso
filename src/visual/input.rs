@@ -9,16 +9,15 @@ use std::ops::Range;
 use gpui_kit::base::input::RopeExt as _;
 use gpui_kit::*;
 
-use super::document::leaf_key;
 use super::view::VisualView;
 
 impl VisualView {
-    fn to_utf16(&self, range: Range<usize>, cx: &App) -> Range<usize> {
+    fn bytes_to_utf16(&self, range: Range<usize>, cx: &App) -> Range<usize> {
         let rope = self.editor.read(cx).text();
         rope.offset_to_offset_utf16(range.start)..rope.offset_to_offset_utf16(range.end)
     }
 
-    fn from_utf16(&self, range: Range<usize>, cx: &App) -> Range<usize> {
+    fn utf16_to_bytes(&self, range: Range<usize>, cx: &App) -> Range<usize> {
         let rope = self.editor.read(cx).text();
         rope.offset_utf16_to_offset(range.start)..rope.offset_utf16_to_offset(range.end)
     }
@@ -29,7 +28,7 @@ impl VisualView {
         if let Some(marked) = &self.marked {
             return marked.clone();
         }
-        range_utf16.map_or(self.caret..self.caret, |r| self.from_utf16(r, cx))
+        range_utf16.map_or(self.caret..self.caret, |r| self.utf16_to_bytes(r, cx))
     }
 }
 
@@ -41,8 +40,8 @@ impl EntityInputHandler for VisualView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.from_utf16(range_utf16, cx);
-        *adjusted = Some(self.to_utf16(range.clone(), cx));
+        let range = self.utf16_to_bytes(range_utf16, cx);
+        *adjusted = Some(self.bytes_to_utf16(range.clone(), cx));
         Some(self.editor.read(cx).text().slice(range).to_string())
     }
 
@@ -53,13 +52,13 @@ impl EntityInputHandler for VisualView {
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.to_utf16(self.caret..self.caret, cx),
+            range: self.bytes_to_utf16(self.caret..self.caret, cx),
             reversed: false,
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.clone().map(|r| self.to_utf16(r, cx))
+        self.marked.clone().map(|r| self.bytes_to_utf16(r, cx))
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -114,9 +113,9 @@ impl EntityInputHandler for VisualView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let range = self.from_utf16(range_utf16, cx);
+        let range = self.utf16_to_bytes(range_utf16, cx);
         let (bix, lix, index) = self.doc.locate(range.start)?;
-        let key = leaf_key(self.doc.blocks[bix].id, lix);
+        let key = self.doc.blocks[bix].leaves[lix].key;
         let geometry = self.geometry.borrow();
         let leaf = geometry.get(&key)?;
         let start = leaf.position_for_index(index);

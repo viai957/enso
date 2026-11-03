@@ -8,7 +8,6 @@ use gpui_kit::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use super::document::{key_block_id, key_leaf_ix};
 use super::view::VisualView;
 
 const DOC: &str = "# Heading with **bold** words\n\nA paragraph with *emphasis*, `code`, a [link](u) and \\* escape &amp; more.\nSoft break नमस्ते दुनिया। 中文 👍🏽 end.\n\n- first item\n- [ ] second **task**\n  - nested\n\n> quoted\n> lines\n\n```rust\nfn main() {}\nlet 中 = 1;\n```\n\n| a | b |\n|---|--:|\n| 中文 | 👍🏽 x |\n";
@@ -67,13 +66,7 @@ fn clicks_resolve_to_source_bytes(cx: &mut TestAppContext) {
         let mut checked = 0;
         let mut kinds = std::collections::HashSet::new();
         for (&key, leaf) in geometry.iter() {
-            let bix = view
-                .doc
-                .blocks
-                .iter()
-                .position(|b| b.id == key_block_id(key))
-                .unwrap();
-            let lix = key_leaf_ix(key);
+            let (bix, lix) = view.doc.leaf_by_key(key).unwrap();
             let block = &view.doc.blocks[bix];
             kinds.insert(std::mem::discriminant(&block.node));
             let map = &block.leaves[lix];
@@ -137,7 +130,7 @@ fn typing_updates_the_rope_and_reparses_one_block(cx: &mut TestAppContext) {
             let v = view.read(cx);
             assert_eq!(v.caret, at + 1);
             assert_eq!(v.doc.blocks.len(), blocks);
-            let parsed = *v.latency.borrow().parsed_bytes.last().unwrap();
+            let parsed = v.last_edit.as_ref().unwrap().parsed_bytes;
             assert!(parsed < 400, "reparsed {parsed} bytes");
             // The caret paints in the edited leaf.
             assert!(v.caret_position().is_some());
@@ -203,18 +196,244 @@ fn vertical_moves_keep_the_goal_x(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(view.read(cx).caret, emoji.find("b**").unwrap() + 1));
 }
 
-/// Known gap (open decision for Phase 1): `EditorState`'s undo and redo
-/// handlers are registered by the `Editor` element, and `undo`/`redo` are not
-/// public, so while only the visual view is rendered they never run. This test
-/// pins the current behaviour so the fix shows up as a change here.
+fn caret_is_valid(cx: &mut TestAppContext, view: &Entity<VisualView>, what: &str) {
+    cx.update(|cx| {
+        let v = view.read(cx);
+        let len = v.editor.read(cx).text().len();
+        assert!(v.caret <= len, "{what}: caret {} past {len}", v.caret);
+        assert!(
+            v.editor.read(cx).text().is_char_boundary(v.caret),
+            "{what}: caret inside a character"
+        );
+        assert!(
+            v.doc.locate(v.caret).is_some() || v.doc.blocks.iter().all(|b| b.leaves.is_empty()),
+            "{what}: caret cannot be placed"
+        );
+    });
+}
+
+fn assert_synced(cx: &mut TestAppContext, view: &Entity<VisualView>, what: &str) {
+    cx.update(|cx| {
+        let v = view.read(cx);
+        assert!(
+            !v.parse_pending(),
+            "{what}: a background parse is still pending"
+        );
+        let text = v.editor.read(cx).text().to_string();
+        super::document::tests::assert_matches_full_parse(&v.doc, &text, what);
+        assert_eq!(
+            v.list.item_count(),
+            v.doc.blocks.len(),
+            "{what}: list items"
+        );
+    });
+}
+
+/// One history across views: text typed in the visual view and in a source
+/// pane (the same `EditorState`) undoes and redoes in order, and the visual
+/// index follows every step.
 #[gpui_kit::test]
-fn undo_does_not_yet_reach_an_unrendered_editor(cx: &mut TestAppContext) {
-    let (handle, view) = open(cx, "one two\n");
+fn undo_and_redo_work_across_views(cx: &mut TestAppContext) {
+    let (handle, view) = open(cx, "one two\n\nthree\n");
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    // Visual typing.
     cx.update(|cx| view.update(cx, |v, _| v.caret = 3));
     cx.simulate_input(handle, "x");
     draw(cx, handle);
-    assert_eq!(source(cx, &view), "onex two\n");
-    cx.simulate_keystrokes(handle, "ctrl-z");
+    assert_eq!(source(cx, &view), "onex two\n\nthree\n");
+    // Source-pane typing: an edit straight on the shared state.
+    cx.update_window(handle, |_, window, cx| {
+        let editor = view.read(cx).editor.clone();
+        editor.update(cx, |state, cx| {
+            state.set_selected_range(10..10, cx);
+            state.replace("Y", window, cx);
+        });
+    })
+    .unwrap();
     draw(cx, handle);
-    assert_eq!(source(cx, &view), "onex two\n");
+    assert_eq!(source(cx, &view), "onex two\n\nYthree\n");
+    assert_synced(cx, &view, "after source typing");
+    // Undo the source edit, then the visual one, from the visual view.
+    cx.simulate_keystrokes(handle, &format!("{primary}-z"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), "onex two\n\nthree\n");
+    assert_synced(cx, &view, "undo 1");
+    cx.simulate_keystrokes(handle, &format!("{primary}-z"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), "one two\n\nthree\n");
+    assert_synced(cx, &view, "undo 2");
+    // The selection comes back with the text: the caret where "x" was typed.
+    cx.update(|cx| assert_eq!(view.read(cx).caret, 3));
+    cx.simulate_keystrokes(handle, &format!("{primary}-shift-z"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), "onex two\n\nthree\n");
+    assert_synced(cx, &view, "redo");
+    caret_is_valid(cx, &view, "redo");
+}
+
+/// Undo restores the scroll position an edit was made at.
+#[gpui_kit::test]
+fn undo_restores_the_scroll_position(cx: &mut TestAppContext) {
+    let text: String = (0..300).map(|i| format!("Paragraph {i}.\n\n")).collect();
+    let (handle, view) = open(cx, &text);
+    let at = text.find("Paragraph 150").unwrap() + 4;
+    cx.update(|cx| {
+        view.update(cx, |v, _| {
+            v.caret = at;
+            v.list.scroll_to_reveal_item(150);
+        })
+    });
+    draw(cx, handle);
+    let before = cx.update(|cx| view.read(cx).list.logical_scroll_top());
+    cx.simulate_input(handle, "x");
+    draw(cx, handle);
+    // Scroll far away, then undo.
+    cx.update(|cx| {
+        view.read(cx).list.scroll_to(gpui_kit::ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        })
+    });
+    draw(cx, handle);
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    cx.simulate_keystrokes(handle, &format!("{primary}-z"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), text);
+    let after = cx.update(|cx| view.read(cx).list.logical_scroll_top());
+    assert_eq!(after.item_ix, before.item_ix);
+    cx.update(|cx| assert_eq!(view.read(cx).caret, at));
+}
+
+/// Random edits from every source the view must follow, each checked against
+/// a whole parse, with a valid caret after every step.
+#[gpui_kit::test]
+fn mixed_edits_keep_the_index_in_sync(cx: &mut TestAppContext) {
+    let base = super::document::tests::SAMPLE.repeat(2)
+        + &(0..40).map(|i| format!("- item {i}\n")).collect::<String>()
+        + "\n```\ncode\n```\n";
+    let (handle, view) = open(cx, &base);
+    let pieces = [
+        "x",
+        "中",
+        " ",
+        "\n",
+        "\n\n",
+        "*",
+        "```\n",
+        "# ",
+        "- ",
+        "|",
+        "<!--",
+        "[a]: /u\n",
+    ];
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    for step in 0..250 {
+        let kind = next(10);
+        let text = source(cx, &view);
+        let mut at = next(text.len() + 1);
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let what = format!("step {step} kind {kind}");
+        match kind {
+            // Visual typing at a caret placed by the view.
+            0..=2 => {
+                cx.update(|cx| view.update(cx, |v, _| v.caret = v.doc.snap(at)));
+                cx.simulate_input(handle, pieces[next(pieces.len())]);
+            }
+            // Visual deletion.
+            3 => {
+                cx.update(|cx| view.update(cx, |v, _| v.caret = v.doc.snap(at)));
+                cx.simulate_keystrokes(handle, "backspace");
+            }
+            // Source-pane typing and deletion.
+            4 | 5 => {
+                let mut end = (at + next(5)).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                let insert = pieces[next(pieces.len())];
+                cx.update_window(handle, |_, window, cx| {
+                    let editor = view.read(cx).editor.clone();
+                    editor.update(cx, |state, cx| {
+                        state.set_selected_range(at..end, cx);
+                        state.replace(insert, window, cx);
+                    });
+                })
+                .unwrap();
+            }
+            6 => cx.simulate_keystrokes(handle, &format!("{primary}-z")),
+            7 => cx.simulate_keystrokes(handle, &format!("{primary}-shift-z")),
+            // Reload: the file changed on disk.
+            8 => {
+                let mut reloaded = text.clone();
+                reloaded.insert_str(at, "\nreloaded line\n");
+                cx.update_window(handle, |_, window, cx| {
+                    let editor = view.read(cx).editor.clone();
+                    editor.update(cx, |state, cx| state.set_value(reloaded, window, cx));
+                })
+                .unwrap();
+            }
+            // Movement only.
+            _ => cx.simulate_keystrokes(handle, "down right"),
+        }
+        draw(cx, handle);
+        // Let the idle settle run, as it would once typing pauses.
+        cx.executor().advance_clock(super::view::SETTLE_AFTER * 2);
+        draw(cx, handle);
+        assert_synced(cx, &view, &what);
+        caret_is_valid(cx, &view, &what);
+    }
+}
+
+/// A large document opens with its first screen parsed at once and the rest
+/// in the background; nothing blank in between.
+#[gpui_kit::test]
+fn open_parses_a_prefix_then_the_rest_in_the_background(cx: &mut TestAppContext) {
+    let text: String = (0..3000)
+        .map(|i| format!("Paragraph {i} with *text*.\n\n"))
+        .collect();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        super::view::init(cx);
+    });
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            let editor = cx.new(|cx| EditorState::new(window, cx).default_value(text.clone()));
+            cx.new(|cx| VisualView::new(editor, window, cx))
+        })
+        .unwrap()
+    });
+    cx.update(|cx| {
+        let v = view.read(cx);
+        assert!(v.loading());
+        assert!(!v.doc.blocks.is_empty(), "the first screen is parsed");
+        assert!(v.doc.blocks.last().unwrap().end <= super::view::OPEN_PREFIX_BYTES + 200);
+    });
+    draw(cx, handle);
+    assert_synced(cx, &view, "after open");
+    cx.update(|cx| {
+        let v = view.read(cx);
+        assert!(!v.loading());
+        assert_eq!(v.doc.blocks.len(), 3000);
+    });
 }
