@@ -716,19 +716,22 @@ impl VisualDocument {
             None => {
                 let start = region_start.min(rope.len());
                 let end = window_end.max(start);
-                let end = if end - start > MAX_SYNC_BYTES {
-                    // Parse no more than the touched lines.
-                    region_end.max(start)
+                if end - start > MAX_SYNC_BYTES {
+                    // Too much to parse here (a large paste): show the text
+                    // as plain paragraphs now, formatted by the background
+                    // parse a moment later.
+                    let end = region_end.max(start);
+                    let window = rope.slice(start..end).to_string();
+                    (plain_blocks(&window, start), lo_block..last, 0)
                 } else {
-                    end
-                };
-                let window = rope.slice(start..end).to_string();
-                let keys = self.keys_of(lo_block..last);
-                (
-                    parse_blocks_reusing(&window, start, keys, &self.definitions),
-                    lo_block..last,
-                    window.len(),
-                )
+                    let window = rope.slice(start..end).to_string();
+                    let keys = self.keys_of(lo_block..last);
+                    (
+                        parse_blocks_reusing(&window, start, keys, &self.definitions),
+                        lo_block..last,
+                        window.len(),
+                    )
+                }
             }
         };
         for block in &mut self.blocks[range.end..] {
