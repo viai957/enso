@@ -868,6 +868,11 @@ pub struct ImageNode {
 }
 
 impl ImageNode {
+    /// The image's Markdown source range, in the parsed text.
+    pub fn span(&self) -> Option<Span> {
+        self.span
+    }
+
     pub fn title(&self) -> String {
         self.title
             .clone()
@@ -917,7 +922,7 @@ impl PartialEq for ImageNode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SourceSegment {
+pub struct SourceSegment {
     pub(crate) rendered: Range<usize>,
     pub(crate) source: Range<usize>,
     /// Whether each rendered character came from a source character of the
@@ -925,6 +930,26 @@ pub(crate) struct SourceSegment {
     /// A decoded entity or an escape maps only as a whole, even an entity
     /// whose characters take as many bytes as its source, like `&acE;`.
     pub(crate) linear: bool,
+}
+
+impl SourceSegment {
+    /// The rendered bytes, relative to the start of the inline node's (or the
+    /// code block's) text.
+    pub fn rendered(&self) -> Range<usize> {
+        self.rendered.clone()
+    }
+
+    /// The Markdown source bytes they were rendered from, in the parsed text.
+    pub fn source(&self) -> Range<usize> {
+        self.source.clone()
+    }
+
+    /// Whether each rendered character maps to a source character of the
+    /// same length at the same distance (plain text); otherwise the segment
+    /// maps only as a whole (an entity, an escape, an inline object).
+    pub fn linear(&self) -> bool {
+        self.linear
+    }
 }
 
 pub(crate) enum SourceRangeSelection {
@@ -1522,6 +1547,11 @@ impl InlineNode {
     }
 
     /// The marks, each a byte range of the text and its style.
+    /// The rendered text's source mapping (see [`SourceSegment`]).
+    pub fn source_mapping(&self) -> &[SourceSegment] {
+        &self.source_segments
+    }
+
     pub fn mark_runs(&self) -> &[(Range<usize>, TextMark)] {
         &self.marks
     }
@@ -2383,6 +2413,11 @@ impl CodeBlock {
     pub fn with_leaf_key(mut self, key: u64) -> Self {
         set_leaf_key(&mut self.state, key);
         self
+    }
+
+    /// The code's source mapping (see [`SourceSegment`]).
+    pub fn source_mapping(&self) -> &[SourceSegment] {
+        &self.source_segments
     }
 
     /// Get the code content of the code block.

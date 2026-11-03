@@ -43,7 +43,7 @@ use super::{
 
 pub use super::node::{
     BlockNode, BlockState, CodeBlock, ColumnumnAlign as ColumnAlign, ImageNode, InlineNode,
-    LinkMark, Paragraph, Span, Table, TextMark,
+    LinkMark, Paragraph, SourceSegment, Span, Table, TextMark,
 };
 
 /// Parses Markdown with the parser [`TextView`](super::TextView) uses,

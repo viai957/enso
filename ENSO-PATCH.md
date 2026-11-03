@@ -19,3 +19,11 @@ visibility-only:
 
 Upstream request: see `UPSTREAM-REQUEST.md`. Drop this fork once a released
 GPUI Kit exposes the same APIs.
+
+## Branch gpui-base-fork-1a (experiment, not pinned by enso)
+
+Adds read-only access to the source mapping GPUI Kit's parser already
+computes, to evaluate driving enso's visual view from GPUI Kit's own parse:
+`SourceSegment` becomes public with `rendered()`, `source()` and `linear()`
+getters (fields stay private), plus `InlineNode::source_mapping()`,
+`CodeBlock::source_mapping()` and `ImageNode::span()`. No behaviour changes.
