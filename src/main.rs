@@ -6,6 +6,8 @@ mod onboarding;
 mod reader;
 mod settings;
 mod stats;
+#[allow(dead_code)]
+mod visual;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
