@@ -32,11 +32,10 @@ use std::{
 
 use gpui_kit::base::input::{Rope, RopeExt as _};
 use gpui_kit::base::text::editor_host::{
-    BlockNode, CodeBlock, ColumnAlign, ImageNode, InlineNode, LinkMark, Paragraph, Span, Table,
-    TextMark,
+    BlockNode, CodeBlock, ColumnAlign, InlineNode, Paragraph, Span, Table,
 };
-use markdown::mdast::{AlignKind, Node};
 
+use super::build::{Builder, Sig, cell_spans, code_sig, list_sig, parse_nodes, span_of, table_sig};
 use super::mapping::{LeafBuilder, LeafMap};
 
 /// The most source a keystroke may parse on the main thread. At about
@@ -52,12 +51,8 @@ static PARSE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// A process-wide unique id for a block or a leaf. Usable from any thread, so
 /// background parses produce keys that never collide with live ones.
-fn fresh_id() -> u64 {
+pub(super) fn fresh_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-pub(crate) fn fresh_id_for_experiment() -> u64 {
-    fresh_id()
 }
 
 /// What a block is, beyond its rendered node, for the edit fast paths.
@@ -91,6 +86,8 @@ pub enum Kind {
 pub struct Item {
     pub span: Range<usize>,
     pub leaves: Range<usize>,
+    /// Position-independent content signature (see `build::Sig`).
+    pub sig: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -98,11 +95,12 @@ pub struct Row {
     pub span: Range<usize>,
     pub cells: Vec<Paragraph>,
     pub leaves: Range<usize>,
+    pub sig: u64,
 }
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        self.span == other.span && self.leaves == other.leaves
+        self.span == other.span && self.leaves == other.leaves && self.sig == other.sig
     }
 }
 
@@ -121,6 +119,10 @@ pub struct Block {
     /// Block-relative spans of the link reference definitions in the block,
     /// at any depth.
     pub defs: Vec<Range<usize>>,
+    /// What renders, independent of position: GPUI Kit's nodes carry absolute
+    /// source positions, so equal blocks from different parses compare
+    /// unequal as nodes.
+    pub sig: u64,
 }
 
 impl Block {
@@ -132,7 +134,8 @@ impl Block {
     /// Whether `other` renders and maps the same, wherever it sits.
     fn same_content(&self, other: &Block) -> bool {
         self.end - self.start == other.end - other.start
-            && self.node == other.node
+            && self.sig == other.sig
+            && self.kind == other.kind
             && self.leaves.len() == other.leaves.len()
             && self
                 .leaves
@@ -189,20 +192,6 @@ pub struct VisualDocument {
     definitions_touched: bool,
 }
 
-pub fn parse_options() -> markdown::ParseOptions {
-    options_at(true)
-}
-
-/// `markdown::to_mdast`, with its panics (markdown 1.0.0 panics on some
-/// inputs, e.g. "Cannot push to non-parent") turned into `None`.
-fn to_mdast_safe(text: &str, options: &markdown::ParseOptions) -> Option<Node> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        markdown::to_mdast(text, options).ok()
-    }))
-    .ok()
-    .flatten()
-}
-
 /// Blocks for text the parser cannot handle: one plain paragraph per run of
 /// non-blank lines, mapped character for character, so the document still
 /// shows and stays editable.
@@ -231,19 +220,16 @@ fn plain_blocks(text: &str, base: usize) -> Vec<Block> {
                 }],
                 kind: Kind::Other,
                 defs: Vec::new(),
+                sig: {
+                    let mut sig = Sig::default();
+                    sig.add(("plain", body));
+                    sig.finish()
+                },
             });
         }
         offset += chunk.len();
     }
     blocks
-}
-
-/// Front matter can only open at the very start of the document; a window
-/// parsed elsewhere must not read a leading `---` as front matter.
-fn options_at(document_start: bool) -> markdown::ParseOptions {
-    let mut options = markdown::ParseOptions::gfm();
-    options.constructs.frontmatter = document_start;
-    options
 }
 
 /// Parses `text`, which starts at absolute offset `base`, into blocks with
@@ -254,33 +240,32 @@ pub fn parse_blocks(text: &str, base: usize) -> Vec<Block> {
 
 /// Parses `text` behind `prelude`, the document's link reference
 /// definitions, so that references in a window resolve exactly as in a whole
-/// parse. Returns the parsed string, the prelude's length in it, and the root
-/// children that belong to `text`.
+/// parse. Front matter only opens at the document start. Returns the parsed
+/// string, the prelude's length in it, and the top-level nodes that belong
+/// to `text`.
 fn parse_with_prelude(
     text: &str,
     prelude: &str,
     document_start: bool,
-) -> Option<(String, usize, Vec<Node>)> {
+) -> Option<(String, usize, Vec<BlockNode>)> {
     let front_matter = document_start && (text.starts_with("---") || text.starts_with("+++"));
     if !prelude.is_empty() && front_matter {
         // Front matter must stay first: append the definitions instead, and
         // drop them again unless a block ran into them (then parse without).
         let full = format!("{text}\n\n{prelude}");
-        let Some(Node::Root(root)) = to_mdast_safe(&full, &options_at(true)) else {
-            return None;
-        };
-        if root.children.iter().any(|c| {
-            c.position()
-                .is_some_and(|p| p.start.offset < text.len() && p.end.offset > text.len())
-        }) {
+        let nodes = parse_nodes(&full, true)?;
+        if nodes
+            .iter()
+            .filter_map(span_of)
+            .any(|s| s.start < text.len() && s.end > text.len())
+        {
             return parse_with_prelude(text, "", document_start);
         }
-        let children = root
-            .children
+        let nodes = nodes
             .into_iter()
-            .filter(|c| c.position().is_some_and(|p| p.start.offset < text.len()))
+            .filter(|n| span_of(n).is_some_and(|s| s.start < text.len()))
             .collect();
-        return Some((full, 0, children));
+        return Some((full, 0, nodes));
     }
     let (full, plen) = if prelude.is_empty() {
         (text.to_string(), 0)
@@ -289,51 +274,37 @@ fn parse_with_prelude(
         let plen = head.len();
         (head + text, plen)
     };
-    let options = options_at(document_start && plen == 0);
-    let Some(Node::Root(root)) = to_mdast_safe(&full, &options) else {
-        return None;
-    };
-    let children = root
-        .children
+    let nodes = parse_nodes(&full, document_start && plen == 0)?;
+    let nodes = nodes
         .into_iter()
-        .filter(|c| c.position().is_some_and(|p| p.start.offset >= plen))
+        .filter(|n| span_of(n).is_some_and(|s| s.start >= plen))
         .collect();
-    Some((full, plen, children))
+    Some((full, plen, nodes))
 }
 
 /// [`parse_blocks`] behind a definitions `prelude`, handing `keys` (from the
 /// blocks being replaced) on to the new leaves in order.
 fn parse_blocks_reusing(text: &str, base: usize, keys: Vec<u64>, prelude: &str) -> Vec<Block> {
     let mut reuse = keys.into_iter();
-    let Some((full, plen, children)) = parse_with_prelude(text, prelude, base == 0) else {
+    let Some((full, plen, nodes)) = parse_with_prelude(text, prelude, base == 0) else {
         return plain_blocks(text, base);
     };
-    let mut blocks = Vec::with_capacity(children.len());
-    for child in &children {
-        let Some(position) = child.position() else {
+    let mut blocks = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(span) = span_of(&node) else {
             continue;
         };
-        let (start, end) = (position.start.offset, position.end.offset);
-        let mut cx = BuildCx {
-            source: &full,
-            reuse: &mut reuse,
-            block_start: start,
-            leaves: Vec::new(),
-            depth: 0,
-            kind: Kind::Other,
-            defs: Vec::new(),
-        };
-        let Some(node) = cx.block(child) else {
-            continue;
-        };
+        let mut cx = Builder::new(&full, span.start, 0, &mut reuse);
+        let node = cx.block(node);
         blocks.push(Block {
             id: fresh_id(),
-            start: base + start - plen,
-            end: base + end - plen,
+            start: base + span.start - plen,
+            end: base + span.end - plen,
             node,
             leaves: cx.leaves,
             kind: cx.kind,
             defs: cx.defs,
+            sig: cx.sig.finish(),
         });
     }
     blocks
@@ -531,7 +502,7 @@ impl VisualDocument {
             && !self.blocks.first().is_some_and(|b| {
                 b.start == 0
                     && matches!(&b.node, BlockNode::CodeBlock(c)
-                        if matches!(c.lang().as_deref(), Some("yaml" | "toml")))
+                        if matches!(c.lang().as_deref(), Some("yml" | "yaml" | "toml")))
             })
     }
 
@@ -815,6 +786,11 @@ impl VisualDocument {
             segs: b.segs,
             empty_src: body.start,
         };
+        let sig = {
+            let mut sig = Sig::default();
+            sig.add(code_sig(lang.as_deref(), meta.as_deref(), &value));
+            sig.finish()
+        };
         let node = BlockNode::CodeBlock(
             CodeBlock::new(value.into(), lang.clone().map(Into::into), None::<Span>)
                 .with_meta(meta.clone().map(Into::into))
@@ -830,6 +806,7 @@ impl VisualDocument {
             body.end = new_body_end.max(body.start);
         }
         block.node = node;
+        block.sig = sig;
         block.leaves = vec![leaf];
         block.end = new_end;
         Some(EditResult {
@@ -883,8 +860,16 @@ impl VisualDocument {
             return None;
         }
         let window = rope.slice(start..end).to_string();
-        let (full, plen, children) = parse_with_prelude(&window, &self.definitions, start == 0)?;
-        let [Node::List(list)] = children.as_slice() else {
+        let (full, plen, mut nodes) = parse_with_prelude(&window, &self.definitions, start == 0)?;
+        if nodes.len() != 1 {
+            return None;
+        }
+        let BlockNode::List {
+            children: list_items,
+            ordered: list_ordered,
+            ..
+        } = nodes.pop()?
+        else {
             return None;
         };
         // Definitions resolve references anywhere: leave them to the paths
@@ -892,23 +877,26 @@ impl VisualDocument {
         if window.contains("]:") || !block.defs.is_empty() {
             return None;
         }
-        let BlockNode::List { ordered, .. } = &block.node else {
+        let BlockNode::List {
+            ordered,
+            start: list_start,
+            ..
+        } = &block.node
+        else {
             return None;
         };
-        if list.ordered != *ordered || list.children.len() != hi - lo {
+        let (ordered, list_start) = (*ordered, *list_start);
+        if list_ordered != ordered || list_items.len() != hi - lo {
             return None;
         }
         // The window starts at a line start that may precede the block start
         // (an indented first item); offsets stay relative to the block.
         let to_rel = start as isize - block.start as isize - plen as isize;
-        let spans: Vec<Range<usize>> = list
-            .children
-            .iter()
-            .map(|c| {
-                let p = c.position().unwrap();
-                add(p.start.offset, to_rel)..add(p.end.offset, to_rel)
-            })
-            .collect();
+        let mut spans: Vec<Range<usize>> = Vec::new();
+        for item in &list_items {
+            let p = span_of(item)?;
+            spans.push(add(p.start, to_rel)..add(p.end, to_rel));
+        }
         // The neighbours must come back where they were.
         if lo < k && spans[0] != items[lo].span {
             return None;
@@ -931,21 +919,14 @@ impl VisualDocument {
             .map(|l| l.key)
             .collect::<Vec<_>>()
             .into_iter();
-        let mut cx = BuildCx {
-            source: &full,
-            reuse: &mut reuse,
-            block_start: 0,
-            leaves: Vec::new(),
-            depth: 1,
-            kind: Kind::Other,
-            defs: Vec::new(),
-        };
+        let mut cx = Builder::new(&full, 0, 1, &mut reuse);
         let mut new_items = Vec::new();
         let mut new_nodes = Vec::new();
-        for child in &list.children {
+        for child in list_items {
             let before = cx.leaves.len();
-            new_nodes.push(cx.block(child)?);
-            new_items.push(before..cx.leaves.len());
+            cx.sig = Sig::default();
+            new_nodes.push(cx.block(child));
+            new_items.push((before..cx.leaves.len(), cx.sig.finish()));
         }
         let mut new_leaves = cx.leaves;
         for leaf in &mut new_leaves {
@@ -973,9 +954,10 @@ impl VisualDocument {
         let replaced: Vec<Item> = spans
             .into_iter()
             .zip(new_items)
-            .map(|(span, leaves)| Item {
+            .map(|(span, (leaves, sig))| Item {
                 span,
                 leaves: leaf_base + leaves.start..leaf_base + leaves.end,
+                sig,
             })
             .collect();
         for item in &mut items[hi..] {
@@ -983,6 +965,9 @@ impl VisualDocument {
             item.leaves = add(item.leaves.start, leaf_delta)..add(item.leaves.end, leaf_delta);
         }
         items.splice(lo..hi, replaced);
+        let mut sig = Sig::default();
+        sig.add(list_sig(ordered, list_start, items));
+        block.sig = sig.finish();
         if let BlockNode::List { children, .. } = &mut block.node {
             children.splice(lo..hi, new_nodes);
         }
@@ -1030,46 +1015,37 @@ impl VisualDocument {
         let delimiter = rope.slice_line(header_row + 1).to_string();
         let delimiter = delimiter.trim_end_matches(['\n', '\r']);
         let mini = format!("{header}\n{delimiter}\n{row_text}");
-        let (mini, _, children) = parse_with_prelude(&mini, &self.definitions, false)?;
-        let [Node::Table(table)] = children.as_slice() else {
+        let (mini, _, nodes) = parse_with_prelude(&mini, &self.definitions, false)?;
+        let [table_node @ BlockNode::Table(table)] = nodes.as_slice() else {
             return None;
         };
-        if table.children.len() != 2 || table.position.as_ref()?.end.offset != mini.len() {
+        if table.rows().count() != 2 || span_of(table_node)?.end != mini.len() {
             return None;
         }
-        let Node::TableRow(row) = &table.children[1] else {
-            return None;
-        };
         let row_start_mini = mini.len() - row_text.len();
-        let row_span_mini = row.position.as_ref()?;
+        let row_span_mini = row_start_mini..mini.len();
+        let cell_ranges = cell_spans(&mini[row_span_mini.clone()], row_start_mini);
         let mut reuse = block.leaves[rows[r].leaves.clone()]
             .iter()
             .map(|l| l.key)
             .collect::<Vec<_>>()
             .into_iter();
-        let mut cx = BuildCx {
-            source: &mini,
-            reuse: &mut reuse,
-            block_start: 0,
-            leaves: Vec::new(),
-            depth: 1,
-            kind: Kind::Other,
-            defs: Vec::new(),
-        };
+        let mut cx = Builder::new(&mini, 0, 1, &mut reuse);
         let mut cells = Vec::new();
-        for cell in &row.children {
-            let Node::TableCell(c) = cell else { continue };
-            let span = BuildCx::span_of(cell)?;
-            cells.push(cx.paragraph(&c.children, span.end));
+        for (c, p) in table.rows().nth(1)?.enumerate() {
+            let cell = cell_ranges.get(c).cloned();
+            let empty = cell.as_ref().map_or(row_span_mini.end, |r| r.start);
+            cx.sig.add(("cell", c));
+            cells.push(cx.paragraph(p, cell, empty));
         }
+        let row_sig = cx.sig.finish();
         // Mini offsets → block-relative.
         let to_rel = (row_abs.start - block.start) as isize - row_start_mini as isize;
         let mut new_leaves = cx.leaves;
         for leaf in &mut new_leaves {
             shift_leaf(leaf, to_rel);
         }
-        let new_span =
-            add(row_span_mini.start.offset, to_rel)..add(row_span_mini.end.offset, to_rel);
+        let new_span = add(row_span_mini.start, to_rel)..add(row_span_mini.end, to_rel);
         let block_id = block.id;
         let aligns = aligns.clone();
         let parsed_bytes = mini.len();
@@ -1094,12 +1070,16 @@ impl VisualDocument {
             span: new_span,
             cells,
             leaves: new_leaf_range,
+            sig: row_sig,
         };
         for row in &mut rows[r + 1..] {
             row.span = add(row.span.start, delta)..add(row.span.end, delta);
             row.leaves = add(row.leaves.start, leaf_delta)..add(row.leaves.end, leaf_delta);
         }
         let all: Vec<Vec<Paragraph>> = rows.iter().map(|row| row.cells.clone()).collect();
+        let mut sig = Sig::default();
+        sig.add(table_sig(&format!("{aligns:?}"), rows));
+        block.sig = sig.finish();
         block.node = BlockNode::Table(Table::new(all, aligns));
         block.end = add(block.end, delta);
         Some(EditResult {
@@ -1239,7 +1219,7 @@ fn reaches_out_block(block: &Block) -> bool {
     matches!(
         block.node,
         BlockNode::List { .. } | BlockNode::Definition { .. } | BlockNode::Blockquote { .. }
-    ) || matches!(&block.node, BlockNode::CodeBlock(code) if code.lang().as_deref() == Some("html"))
+    ) || matches!(block.node, BlockNode::Root { .. })
 }
 
 /// Whether `block` opens a code fence it never closes.
@@ -1262,7 +1242,7 @@ fn unclosed_fence(block: &str) -> bool {
 
 /// Whether `line` closes a fence of `len` × `ch`: up to three spaces, at
 /// least `len` fence characters, then only whitespace.
-fn is_closing_fence(line: &str, ch: u8, len: usize) -> bool {
+pub(super) fn is_closing_fence(line: &str, ch: u8, len: usize) -> bool {
     let line = line.trim_end_matches(['\n', '\r']);
     let indent = line.bytes().take_while(|&b| b == b' ').count();
     if indent > 3 {
@@ -1271,363 +1251,6 @@ fn is_closing_fence(line: &str, ch: u8, len: usize) -> bool {
     let rest = &line[indent..];
     let run = rest.bytes().take_while(|&b| b == ch).count();
     run >= len && rest[run..].trim().is_empty()
-}
-
-struct BuildCx<'a> {
-    /// The parsed window; mdast offsets index it.
-    source: &'a str,
-    /// Leaf keys of the leaves being replaced, handed on in order so that
-    /// geometry from the last frame still addresses the edited text (the IME
-    /// asks for bounds before the next frame).
-    reuse: &'a mut std::vec::IntoIter<u64>,
-    block_start: usize,
-    leaves: Vec<LeafMap>,
-    /// 0 for a top-level block.
-    depth: usize,
-    /// The fast-path description of the top-level block.
-    kind: Kind,
-    defs: Vec<Range<usize>>,
-}
-
-/// A paragraph under construction: inline runs and the leaf's mapping.
-#[derive(Default)]
-struct InlineBuilder {
-    leaf: LeafBuilder,
-    nodes: Vec<InlineNode>,
-    run_start: usize,
-    run_marks: Vec<(Range<usize>, TextMark)>,
-}
-
-impl InlineBuilder {
-    fn flush(&mut self) {
-        let end = self.leaf.text.len();
-        if end > self.run_start {
-            let text = self.leaf.text[self.run_start..end].to_string();
-            self.nodes
-                .push(InlineNode::new(text).marks(std::mem::take(&mut self.run_marks)));
-        }
-        self.run_start = end;
-    }
-
-    fn mark(&mut self, start: usize, mark: &TextMark) {
-        let end = self.leaf.text.len();
-        if end > start {
-            self.run_marks
-                .push((start - self.run_start..end - self.run_start, mark.clone()));
-        }
-    }
-}
-
-impl BuildCx<'_> {
-    fn rel(&self, offset: usize) -> usize {
-        offset - self.block_start
-    }
-
-    fn span_of(node: &Node) -> Option<Range<usize>> {
-        node.position().map(|p| p.start.offset..p.end.offset)
-    }
-
-    fn key(&mut self) -> u64 {
-        self.reuse.next().unwrap_or_else(fresh_id)
-    }
-
-    fn push_leaf(&mut self, b: InlineBuilder, empty_src: usize) -> Paragraph {
-        let key = self.key();
-        let mut paragraph = Paragraph::default();
-        for node in b.nodes {
-            paragraph.push(node);
-        }
-        self.leaves.push(LeafMap {
-            key,
-            text: b.leaf.text,
-            segs: b.leaf.segs,
-            empty_src,
-        });
-        paragraph.with_leaf_key(key)
-    }
-
-    fn paragraph(&mut self, children: &[Node], empty_src: usize) -> Paragraph {
-        let mut b = InlineBuilder::default();
-        for child in children {
-            self.inline(child, &TextMark::default(), &mut b);
-        }
-        b.flush();
-        self.push_leaf(b, self.rel(empty_src))
-    }
-
-    fn inline(&mut self, node: &Node, mark: &TextMark, b: &mut InlineBuilder) {
-        let Some(span) = Self::span_of(node) else {
-            return;
-        };
-        let base = self.rel(span.start);
-        let start = b.leaf.text.len();
-        match node {
-            Node::Text(text) => {
-                b.leaf
-                    .push_prose(&text.value, &self.source[span.clone()], base);
-                b.mark(start, mark);
-            }
-            Node::Strong(n) => self.children(&n.children, &mark.clone().bold(), b),
-            Node::Emphasis(n) => self.children(&n.children, &mark.clone().italic(), b),
-            Node::Delete(n) => self.children(&n.children, &mark.clone().strikethrough(), b),
-            Node::Link(n) => {
-                let link = LinkMark {
-                    url: n.url.clone().into(),
-                    title: n.title.clone().map(Into::into),
-                    ..Default::default()
-                };
-                self.children(&n.children, &mark.clone().link(link), b)
-            }
-            Node::LinkReference(n) => self.children(&n.children, &mark.clone().underline(), b),
-            Node::InlineCode(code) => {
-                let src = &self.source[span.clone()];
-                let ticks = src.bytes().take_while(|&c| c == b'`').count();
-                b.leaf
-                    .push_aligned(&code.value, &src[ticks..], base + ticks);
-                b.mark(start, &mark.clone().code());
-            }
-            Node::InlineMath(math) => {
-                b.leaf
-                    .push_aligned(&math.value, &self.source[span.clone()], base);
-                b.mark(start, &mark.clone().code());
-            }
-            Node::Html(html) => {
-                b.leaf
-                    .push_aligned(&html.value, &self.source[span.clone()], base);
-                b.mark(start, &mark.clone().code());
-            }
-            Node::Break(_) => {
-                b.leaf.push_atomic("\n", base..self.rel(span.end));
-                b.mark(start, mark);
-            }
-            Node::FootnoteReference(_) => {
-                b.leaf
-                    .push_aligned(&self.source[span.clone()], &self.source[span.clone()], base);
-                b.mark(start, &mark.clone().code());
-            }
-            Node::Image(image) => {
-                b.flush();
-                let mut node = ImageNode::default();
-                node.url = image.url.clone().into();
-                node.alt = Some(image.alt.clone().into());
-                node.title = image.title.clone().map(Into::into);
-                b.leaf.push_atomic("\u{FFFC}", base..self.rel(span.end));
-                b.nodes.push(InlineNode::image(node));
-                b.run_start = b.leaf.text.len();
-            }
-            other => {
-                if let Some(children) = other.children() {
-                    self.children(children, mark, b);
-                }
-            }
-        }
-    }
-
-    fn children(&mut self, children: &[Node], mark: &TextMark, b: &mut InlineBuilder) {
-        for child in children {
-            self.inline(child, mark, b);
-        }
-    }
-
-    /// A code-like leaf: `value` read from the node's source, skipping a
-    /// fence line when there is one.
-    fn code(
-        &mut self,
-        value: &str,
-        lang: Option<String>,
-        meta: Option<String>,
-        span: Range<usize>,
-    ) -> BlockNode {
-        let src = &self.source[span.clone()];
-        let first = src.trim_start();
-        let fenced = first.starts_with("```")
-            || first.starts_with("~~~")
-            || first.starts_with("---")
-            || first.starts_with("+++");
-        let body = if fenced {
-            src.find('\n').map_or(src.len(), |i| i + 1)
-        } else {
-            0
-        };
-        let mut b = LeafBuilder::default();
-        b.push_aligned(value, &src[body..], self.rel(span.start) + body);
-        let key = self.key();
-        self.leaves.push(LeafMap {
-            key,
-            text: b.text,
-            segs: b.segs,
-            empty_src: self.rel(span.start) + body,
-        });
-        // The fence fast path needs a top-level, unindented ``` or ~~~ fence.
-        let starts_line = self.source[..span.start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| c == '\n');
-        let front_matter = matches!(lang.as_deref(), Some("yaml" | "toml"))
-            && self.block_start == 0
-            && span.start == 0;
-        if self.depth == 0
-            && starts_line
-            && let Some(ch) = src
-                .bytes()
-                .next()
-                .filter(|c| matches!(c, b'`' | b'~') || (front_matter && matches!(c, b'-' | b'+')))
-        {
-            let len = src.bytes().take_while(|&c| c == ch).count();
-            if len >= 3 {
-                let trimmed = src.trim_end_matches(['\n', '\r']);
-                let last_line_start = trimmed.rfind('\n').map(|i| i + 1);
-                let closed = last_line_start
-                    .filter(|&s| s >= body)
-                    .is_some_and(|s| is_closing_fence(&src[s..], ch, len));
-                let body_end = if closed {
-                    last_line_start.unwrap()
-                } else {
-                    src.len()
-                };
-                self.kind = Kind::Fence {
-                    body: body..body_end.max(body),
-                    closed,
-                    ch,
-                    len,
-                    lang: lang.clone(),
-                    meta: meta.clone(),
-                };
-            }
-        }
-        BlockNode::CodeBlock(
-            CodeBlock::new(value.to_string().into(), lang.map(Into::into), None::<Span>)
-                .with_meta(meta.map(Into::into))
-                .with_leaf_key(key),
-        )
-    }
-
-    fn nested(&mut self, node: &Node) -> Option<BlockNode> {
-        self.depth += 1;
-        let out = self.block(node);
-        self.depth -= 1;
-        out
-    }
-
-    fn block(&mut self, node: &Node) -> Option<BlockNode> {
-        let span = Self::span_of(node)?;
-        Some(match node {
-            Node::Paragraph(p) => BlockNode::Paragraph(self.paragraph(&p.children, span.end)),
-            Node::Heading(h) => BlockNode::Heading {
-                level: h.depth,
-                children: self.paragraph(&h.children, span.end),
-                span: None,
-            },
-            Node::ThematicBreak(_) => BlockNode::HorizontalRule { span: None },
-            Node::Blockquote(q) => BlockNode::Blockquote {
-                children: q.children.iter().filter_map(|c| self.nested(c)).collect(),
-                span: None,
-            },
-            Node::FootnoteDefinition(d) => BlockNode::Blockquote {
-                children: d.children.iter().filter_map(|c| self.nested(c)).collect(),
-                span: None,
-            },
-            Node::List(list) => {
-                let top = self.depth == 0;
-                let mut items = Vec::new();
-                let mut children = Vec::new();
-                for child in &list.children {
-                    let before = self.leaves.len();
-                    let Some(node) = self.nested(child) else {
-                        continue;
-                    };
-                    if let Some(s) = Self::span_of(child) {
-                        items.push(Item {
-                            span: self.rel(s.start)..self.rel(s.end),
-                            leaves: before..self.leaves.len(),
-                        });
-                    }
-                    children.push(node);
-                }
-                if top {
-                    self.kind = Kind::List { items };
-                }
-                BlockNode::List {
-                    children,
-                    ordered: list.ordered,
-                    start: list.start,
-                    span: None,
-                }
-            }
-            Node::ListItem(item) => {
-                let mut children: Vec<BlockNode> = item
-                    .children
-                    .iter()
-                    .filter_map(|c| self.nested(c))
-                    .collect();
-                if children.is_empty() {
-                    // An empty item still takes a caret.
-                    let p = self.push_leaf(InlineBuilder::default(), self.rel(span.end));
-                    children.push(BlockNode::Paragraph(p));
-                }
-                BlockNode::ListItem {
-                    children,
-                    spread: item.spread,
-                    checked: item.checked,
-                    span: None,
-                }
-            }
-            Node::Code(code) => self.code(&code.value, code.lang.clone(), code.meta.clone(), span),
-            Node::Math(math) => self.code(&math.value, Some("math".into()), None, span),
-            Node::Html(html) => self.code(&html.value, Some("html".into()), None, span),
-            Node::Yaml(y) => self.code(&y.value, Some("yaml".into()), None, span),
-            Node::Toml(t) => self.code(&t.value, Some("toml".into()), None, span),
-            Node::Table(table) => {
-                let aligns: Vec<ColumnAlign> = table
-                    .align
-                    .iter()
-                    .map(|a| match a {
-                        AlignKind::Left => ColumnAlign::Left,
-                        AlignKind::Right => ColumnAlign::Right,
-                        AlignKind::Center => ColumnAlign::Center,
-                        AlignKind::None => ColumnAlign::None,
-                    })
-                    .collect();
-                let mut rows = Vec::new();
-                for row in &table.children {
-                    let Node::TableRow(row_node) = row else {
-                        continue;
-                    };
-                    let before = self.leaves.len();
-                    let mut cells = Vec::new();
-                    for cell in &row_node.children {
-                        let Node::TableCell(c) = cell else { continue };
-                        let cell_span = Self::span_of(cell).unwrap_or(span.clone());
-                        cells.push(self.paragraph(&c.children, cell_span.end));
-                    }
-                    let row_span = Self::span_of(row).unwrap_or(span.clone());
-                    rows.push(Row {
-                        span: self.rel(row_span.start)..self.rel(row_span.end),
-                        cells,
-                        leaves: before..self.leaves.len(),
-                    });
-                }
-                let all = rows.iter().map(|r| r.cells.clone()).collect();
-                if self.depth == 0 {
-                    self.kind = Kind::Table {
-                        rows,
-                        aligns: aligns.clone(),
-                    };
-                }
-                BlockNode::Table(Table::new(all, aligns))
-            }
-            Node::Definition(def) => {
-                self.defs.push(self.rel(span.start)..self.rel(span.end));
-                BlockNode::Definition {
-                    identifier: def.identifier.clone().into(),
-                    url: def.url.clone().into(),
-                    title: def.title.clone().map(Into::into),
-                    span: None,
-                }
-            }
-            _ => return None,
-        })
-    }
 }
 
 /// The edited range: the `old` range of `before` and the length of its
@@ -1822,7 +1445,7 @@ pub(crate) mod tests {
                 .blocks
                 .iter()
                 .zip(&whole.blocks)
-                .all(|(x, y)| x.node == y.node && x.kind == y.kind)
+                .all(|(x, y)| x.sig == y.sig && x.kind == y.kind)
     }
 
     pub(crate) fn assert_matches_full_parse(doc: &VisualDocument, text: &str, what: &str) {
@@ -1843,7 +1466,7 @@ pub(crate) mod tests {
             );
         }
         for (x, y) in doc.blocks.iter().zip(&full.blocks) {
-            assert!(x.node == y.node, "{what}: node differs at {}", x.start);
+            assert_eq!(x.sig, y.sig, "{what}: content differs at {}", x.start);
             assert_eq!(x.kind, y.kind, "{what}: kind differs at {}", x.start);
         }
         for (bix, block) in doc.blocks.iter().enumerate() {
@@ -2247,6 +1870,75 @@ pub(crate) mod tests {
             );
         }
         eprintln!("typing paths: {paths:?}");
+    }
+
+    /// The constructs the own-tree parser rendered differently from the reader
+    /// now render as GPUI Kit's reader does, and every caret position in
+    /// them still maps to source and back.
+    #[test]
+    fn reader_constructs_render_and_map() {
+        type Check<'a> = &'a dyn Fn(&VisualDocument) -> bool;
+        let cases: [(&str, &str, Check); 6] = [
+            (
+                "nested task list",
+                "- [ ] task\n  - [x] nested done\n  - nested\n",
+                &|d| d.blocks[0].leaves.len() == 3,
+            ),
+            (
+                "reference link",
+                "See [the docs][d].\n\n[d]: https://example.com\n",
+                &|d| {
+                    let BlockNode::Paragraph(p) = &d.blocks[0].node else {
+                        return false;
+                    };
+                    p.children()
+                        .iter()
+                        .flat_map(|n| n.mark_runs())
+                        .any(|(_, m)| m.link.is_some())
+                },
+            ),
+            (
+                "footnote reference",
+                "A claim.[^1]\n\n[^1]: The source.\n",
+                &|d| d.blocks[0].leaves[0].text.contains("[1]"),
+            ),
+            ("inline HTML", "Some <kbd>Ctrl</kbd> text.\n", &|d| {
+                d.blocks[0].leaves[0].text == "Some Ctrl text."
+            }),
+            ("math block", "Inline $x^2$ and\n\n$$\ny = 1\n$$\n", &|d| {
+                d.blocks.len() == 2 && d.blocks[1].leaves[0].text == "y = 1"
+            }),
+            (
+                "HTML block",
+                "<div>\n<p>block</p>\n</div>\n\nafter\n",
+                &|d| {
+                    // An atom: rendered, edited in source; the caret skips it.
+                    d.blocks[0].leaves.is_empty() && d.blocks[1].leaves[0].text == "after"
+                },
+            ),
+        ];
+        for (what, text, check) in cases {
+            let doc = VisualDocument::parse(text);
+            assert!(check(&doc), "{what}: {:?}", shape(&doc));
+            for block in &doc.blocks {
+                for leaf in &block.leaves {
+                    for i in leaf
+                        .text
+                        .grapheme_indices(true)
+                        .map(|(i, _)| i)
+                        .chain([leaf.text.len()])
+                        .filter(|&i| leaf.is_stop(i))
+                    {
+                        assert_eq!(
+                            leaf.src_to_leaf(leaf.leaf_to_src(i)),
+                            i,
+                            "{what}: {:?} at {i}",
+                            leaf.text
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Replays a case the fuzzer dumped (`ENSO_FUZZ_DUMP`): set `ENSO_CASE`

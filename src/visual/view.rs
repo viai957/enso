@@ -384,7 +384,7 @@ impl VisualView {
         };
         let leaf = &self.doc.blocks[bix].leaves[lix];
         if index > 0 {
-            let prev = prev_boundary(&leaf.text, index);
+            let prev = leaf.snap_index(prev_boundary(&leaf.text, index), false);
             let start = self.doc.src_of(bix, lix, prev);
             let end = self.caret.max(start);
             let end = if end == start {
@@ -410,7 +410,7 @@ impl VisualView {
         };
         let leaf = &self.doc.blocks[bix].leaves[lix];
         if index < leaf.len() {
-            let next = next_boundary(&leaf.text, index);
+            let next = leaf.snap_index(next_boundary(&leaf.text, index), true);
             let end = self.doc.src_of(bix, lix, next);
             if end > self.caret {
                 self.edit(self.caret..end, "", window, cx);
@@ -536,9 +536,11 @@ impl VisualView {
         };
         let leaf = &self.doc.blocks[bix].leaves[lix];
         let target = if forward && index < leaf.len() {
-            Some((bix, lix, next_boundary(&leaf.text, index)))
+            let next = next_boundary(&leaf.text, index);
+            Some((bix, lix, leaf.snap_index(next, true)))
         } else if !forward && index > 0 {
-            Some((bix, lix, prev_boundary(&leaf.text, index)))
+            let prev = prev_boundary(&leaf.text, index);
+            Some((bix, lix, leaf.snap_index(prev, false)))
         } else {
             self.doc.step_leaf(bix, lix, forward).map(|(b, l)| {
                 let len = self.doc.blocks[b].leaves[l].len();

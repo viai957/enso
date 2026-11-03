@@ -118,6 +118,29 @@ impl LeafMap {
         best
     }
 
+    /// Whether the caret can rest at leaf byte `index`: not strictly inside a
+    /// run that maps only as a whole (an entity, synthesized text like a
+    /// footnote's `[1]`, an image atom).
+    pub fn is_stop(&self, index: usize) -> bool {
+        !self
+            .segs
+            .iter()
+            .any(|s| !s.linear && s.leaf.start < index && index < s.leaf.end)
+    }
+
+    /// `index`, moved out of a whole-mapped run to its end (`forward`) or start.
+    pub fn snap_index(&self, index: usize, forward: bool) -> usize {
+        match self
+            .segs
+            .iter()
+            .find(|s| !s.linear && s.leaf.start < index && index < s.leaf.end)
+        {
+            Some(s) if forward => s.leaf.end,
+            Some(s) => s.leaf.start,
+            None => index,
+        }
+    }
+
     /// Distance from `src` to this leaf's source, zero when inside.
     pub fn src_distance(&self, src: usize) -> usize {
         let range = self.src_range();
