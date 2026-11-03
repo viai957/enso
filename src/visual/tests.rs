@@ -78,9 +78,9 @@ fn clicks_resolve_to_source_bytes(cx: &mut TestAppContext) {
                 .chain([map.len()]);
             for i in boundaries {
                 let at = leaf.position_for_index(i);
-                // Half a pixel left of the boundary: GPUI's whole-layout hit
-                // test rounds an exact boundary up in code text.
-                let click = point(at.x - px(0.5), at.y + leaf.line_height() / 2.);
+                // Exactly at the boundary (issue 8: code text used to round
+                // an exact boundary up).
+                let click = point(at.x, at.y + leaf.line_height() / 2.);
                 let src = view.source_for_point(click).unwrap();
                 let expected = view.doc.src_of(bix, lix, i);
                 // A soft-wrap edge is one caret position for two indices.
@@ -629,4 +629,95 @@ fn word_and_paragraph_selection(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assert!(view.read(cx).caret_position().is_some());
     });
+}
+
+/// Reference links resolve through the document's definitions, wherever
+/// they are, and follow an edit to a definition (issue 7).
+#[gpui_kit::test]
+fn reference_definitions_update_every_link(cx: &mut TestAppContext) {
+    let doc = "See [the docs][d] here.\n\nMiddle text.\n\nAnd [again][D] there.\n\n[d]: https://one.example\n";
+    let (handle, view) = open(cx, doc);
+    let link_point = |cx: &mut TestAppContext, word: &str| {
+        cx.update(|cx| {
+            let v = view.read(cx);
+            let src = doc.find(word).unwrap() + 1;
+            let (bix, lix, index) = v.doc.locate(src).unwrap();
+            let key = v.doc.blocks[bix].leaves[lix].key;
+            let geometry = v.geometry.borrow();
+            let leaf = &geometry[&key];
+            let p = leaf.position_for_index(index);
+            point(p.x, p.y + leaf.line_height() / 2.)
+        })
+    };
+    let secondary = cx.update(|cx| gpui_kit::Modifiers::secondary_key(cx));
+    let mut follow = |cx: &mut TestAppContext, word: &str| {
+        let at = link_point(cx, word);
+        click(cx, handle, at, 1, secondary);
+        draw(cx, handle);
+        cx.opened_url()
+    };
+    // A plain click only places the caret.
+    let at = link_point(cx, "docs");
+    click(cx, handle, at, 1, Default::default());
+    draw(cx, handle);
+    assert_eq!(cx.opened_url(), None);
+    let caret = cx.update(|cx| view.read(cx).caret);
+    assert!((doc.find("docs").unwrap()..doc.find("docs").unwrap() + 5).contains(&caret));
+    // Cmd/Ctrl-click follows, through the definition (matched ignoring case).
+    assert_eq!(follow(cx, "again").as_deref(), Some("https://one.example"));
+    // Edit the definition in the source; every link follows.
+    let edit = |cx: &mut TestAppContext, from: &str, to: &str| {
+        cx.update_window(handle, |_, window, cx| {
+            let editor = view.read(cx).editor.clone();
+            editor.update(cx, |e, cx| {
+                let at = e.text().to_string().find(from).unwrap();
+                e.set_selected_range(at..at + from.len(), cx);
+                e.replace(to.to_string(), window, cx);
+            });
+        })
+        .unwrap();
+        draw(cx, handle);
+        draw(cx, handle);
+    };
+    edit(cx, "one.", "two.");
+    assert_eq!(follow(cx, "docs").as_deref(), Some("https://two.example"));
+    edit(cx, "two.", "three.");
+    assert_eq!(
+        follow(cx, "again").as_deref(),
+        Some("https://three.example")
+    );
+}
+
+fn click(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    click_count: usize,
+    modifiers: gpui_kit::Modifiers,
+) {
+    use gpui_kit::InputEvent as _;
+    cx.update_window(handle, |_, window, cx| {
+        window.dispatch_event(
+            gpui_kit::MouseDownEvent {
+                button: gpui_kit::MouseButton::Left,
+                position,
+                modifiers,
+                click_count,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position,
+                modifiers,
+                click_count,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
 }

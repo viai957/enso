@@ -368,6 +368,33 @@ impl VisualDocument {
         self.blocks
     }
 
+    /// The source of every link reference definition, in document order.
+    pub fn definitions(&self) -> &str {
+        &self.definitions
+    }
+
+    /// The link reference definitions, first definition of an identifier
+    /// first (it wins, as in CommonMark).
+    pub fn link_references(&self) -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for node in super::build::parse_nodes(&self.definitions, false).unwrap_or_default() {
+            if let BlockNode::Definition {
+                identifier,
+                url,
+                title,
+                ..
+            } = node
+            {
+                out.push((
+                    identifier.to_string(),
+                    url.to_string(),
+                    title.map(|t| t.to_string()),
+                ));
+            }
+        }
+        out
+    }
+
     fn refresh_definitions(&mut self, text: &Rope) {
         let mut out = String::new();
         for block in &self.blocks {
