@@ -3469,6 +3469,80 @@ mod transition_tests {
         cx.update(|cx| assert_eq!(visual.read(cx).caret, far - 2 + 2));
     }
 
+    /// Opening, viewing in every mode and closing an unedited file leaves
+    /// its bytes alone and never writes it; a visual edit changes only the
+    /// bytes it typed. LF and CRLF files, odd but valid Markdown.
+    #[gpui_kit::test]
+    fn visual_round_trip_and_minimal_diff_on_disk(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let directory = std::env::temp_dir().join(format!("enso-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let lf = "Title\n=====\n\nSome *odd*   spacing\t\nand a hard break  \nhere.\n\n* star\n+ plus\n    - deep\n\n1) paren\n2) list\n\n| a |b|\n|:-|-:|\n|x| y |\n\n<div align=\"center\">\nhtml\n</div>\n\n[r]: https://example.com  \"T\"\n\n~~~\ncode\n~~~\nNo final newline";
+        let crlf = lf.replace('\n', "\r\n");
+        for (name, original) in [("lf.md", lf.to_string()), ("crlf.md", crlf)] {
+            let path = directory.join(name);
+            std::fs::write(&path, &original).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let source = original.clone();
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Default::default(),
+                            size: size(px(1000.), px(700.)),
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let mut view = Enso::new(window, cx);
+                            view.add_document(Some(path.clone()), source, None, window, cx);
+                            view
+                        })
+                    },
+                )
+                .unwrap()
+            });
+            draw(cx, handle);
+            for keys in ["ctrl-e", "ctrl-e", "ctrl-\\", "ctrl-\\"] {
+                cx.simulate_keystrokes(handle, keys);
+                draw(cx, handle);
+            }
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            draw(cx, handle);
+            cx.update(|cx| {
+                let v = view.read(cx);
+                assert!(v.mode == Mode::Visual);
+                assert!(!v.documents[0].dirty, "{name}: viewing is not editing");
+            });
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "{name}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified,
+                "{name}: not rewritten"
+            );
+            // Type into the second paragraph in the visual editor.
+            let visual = cx.update(|cx| view.read(cx).documents[0].visual.clone().unwrap());
+            let at = original.find("spacing").unwrap();
+            cx.update(|cx| visual.update(cx, |v, cx| v.place_caret(at, None, cx)));
+            cx.simulate_input(handle, "wide ");
+            draw(cx, handle);
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            draw(cx, handle);
+            let mut expected = original.clone();
+            expected.insert_str(at, "wide ");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+            cx.update(|cx| assert!(!view.read(cx).documents[0].dirty, "{name}: saved"));
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[gpui_kit::test]
     fn close_file_with_no_tabs_closes_the_window(cx: &mut TestAppContext) {
         cx.update(|cx| {
