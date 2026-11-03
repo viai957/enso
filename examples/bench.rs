@@ -15,6 +15,9 @@
 //!
 //! Samples are also written as JSON lines to `target/bench/<size>.jsonl`.
 
+#[path = "../src/markdown_edit.rs"]
+#[allow(dead_code)]
+mod markdown_edit;
 #[path = "../src/visual/mod.rs"]
 #[allow(dead_code)]
 mod visual;

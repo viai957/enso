@@ -74,6 +74,7 @@ pub const SETTLE_AFTER: Duration = Duration::from_millis(300);
 const SCROLL_HISTORY: usize = 512;
 
 pub fn init(cx: &mut App) {
+    super::commands::init(cx);
     let (undo, redo, redo_alt) = if cfg!(target_os = "macos") {
         ("cmd-z", "cmd-shift-z", "cmd-y")
     } else {
@@ -113,6 +114,10 @@ pub struct VisualView {
     pub list: ListState,
     /// The caret as an absolute source byte offset: the only caret state.
     pub caret: usize,
+    /// The other end of the selection, when there is one (source offset).
+    pub anchor: Option<usize>,
+    /// A mouse drag is selecting.
+    dragging: bool,
     /// The x the caret keeps across vertical moves.
     goal_x: Option<Pixels>,
     /// The IME's marked text, a source byte range.
@@ -176,6 +181,8 @@ impl VisualView {
             doc,
             list,
             caret,
+            anchor: None,
+            dragging: false,
             goal_x: None,
             marked: None,
             geometry: Rc::default(),
@@ -402,9 +409,51 @@ impl VisualView {
         });
         self.sync(cx);
         self.caret = range.start + text.len();
+        self.anchor = None;
         self.goal_x = None;
         self.after_caret_change(cx);
         self.perf.borrow_mut().handler_done();
+    }
+
+    /// The selection as a source range (empty at the caret when none).
+    pub fn selection(&self) -> Range<usize> {
+        match self.anchor {
+            Some(anchor) => anchor.min(self.caret)..anchor.max(self.caret),
+            None => self.caret..self.caret,
+        }
+    }
+
+    /// [`edit`](Self::edit), then selects `select` (a command's result).
+    pub fn edit_and_select(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        select: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit(range, text, window, cx);
+        self.anchor = (!select.is_empty()).then_some(select.start);
+        self.caret = select.end;
+        self.after_caret_change(cx);
+    }
+
+    /// Before a caret move: start or keep a selection when extending, else
+    /// drop it. Returns the edge to collapse to when a selection is dropped
+    /// by a plain horizontal move.
+    fn begin_move(&mut self, extend: bool, forward: bool) -> Option<usize> {
+        if extend {
+            self.anchor.get_or_insert(self.caret);
+            return None;
+        }
+        let selection = self.selection();
+        self.anchor = None;
+        let edge = if forward {
+            selection.end
+        } else {
+            selection.start
+        };
+        (!selection.is_empty()).then_some(edge)
     }
 
     fn remember_scroll(&mut self) {
@@ -429,6 +478,11 @@ impl VisualView {
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         // A bound key runs its action instead of the key-down listeners.
         self.perf.borrow_mut().input();
+        let selection = self.selection();
+        if !selection.is_empty() {
+            self.edit(selection, "", window, cx);
+            return;
+        }
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -455,6 +509,11 @@ impl VisualView {
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        let selection = self.selection();
+        if !selection.is_empty() {
+            self.edit(selection, "", window, cx);
+            return;
+        }
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -470,17 +529,8 @@ impl VisualView {
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
-        let in_code = self
-            .doc
-            .locate(self.caret)
-            .is_some_and(|(b, _, _)| matches!(self.doc.blocks[b].node, BlockNode::CodeBlock(_)));
-        let caret = self.caret;
-        self.edit(
-            caret..caret,
-            if in_code { "\n" } else { "\n\n" },
-            window,
-            cx,
-        );
+        self.enter_command(window, cx);
+        self.perf.borrow_mut().handler_done();
     }
 
     /// Undo or redo in the one history the document has, shared with every
@@ -585,8 +635,14 @@ impl VisualView {
 
     // ----- caret movement -------------------------------------------------
 
-    fn move_horizontal(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn move_horizontal(&mut self, forward: bool, extend: bool, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        if let Some(edge) = self.begin_move(extend, forward) {
+            self.caret = edge;
+            self.goal_x = None;
+            self.after_caret_change(cx);
+            return;
+        }
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -677,8 +733,9 @@ impl VisualView {
         false
     }
 
-    fn move_vertical(&mut self, down: bool, cx: &mut Context<Self>) {
+    pub(super) fn move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        self.begin_move(extend, down);
         if self.try_vertical(down) {
             self.pending_vertical = None;
             self.caret_blink.reset(cx);
@@ -691,8 +748,9 @@ impl VisualView {
         cx.notify();
     }
 
-    fn line_edge(&mut self, end: bool, cx: &mut Context<Self>) {
+    pub(super) fn line_edge(&mut self, end: bool, extend: bool, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        self.begin_move(extend, end);
         let Some((top, line_height, _)) = self.caret_position() else {
             return;
         };
@@ -751,13 +809,54 @@ impl VisualView {
         self.perf.borrow_mut().input();
         window.focus(&self.focus, cx);
         if let Some(src) = self.source_for_point(event.position) {
+            if event.modifiers.shift {
+                self.anchor.get_or_insert(self.caret);
+            } else {
+                self.anchor = None;
+            }
             self.caret = src;
             self.marked = None;
             self.goal_x = None;
+            self.dragging = true;
+            match event.click_count {
+                2 => self.select_word(cx),
+                n if n >= 3 => self.select_paragraph(cx),
+                _ => {}
+            }
             self.caret_blink.reset(cx);
             cx.notify();
         }
         self.perf.borrow_mut().handler_done();
+    }
+
+    /// Drag-select, scrolling when the pointer leaves the page vertically.
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
+            self.dragging = false;
+            return;
+        }
+        let viewport = self.list.viewport_bounds();
+        let edge = px(24.);
+        if event.position.y < viewport.top() + edge {
+            self.list
+                .scroll_by((event.position.y - viewport.top() - edge).min(px(-4.)));
+        } else if event.position.y > viewport.bottom() - edge {
+            self.list
+                .scroll_by((event.position.y - viewport.bottom() + edge).max(px(4.)));
+        }
+        if let Some(src) = self.source_for_point(event.position) {
+            self.anchor.get_or_insert(self.caret);
+            self.caret = src;
+            if self.anchor == Some(self.caret) {
+                self.anchor = None;
+            }
+            self.caret_blink.reset(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.dragging = false;
     }
 
     // ----- rendering --------------------------------------------------------
@@ -913,15 +1012,48 @@ impl VisualView {
             .into_any_element()
     }
 
-    /// Decorations: the IME's marked text.
+    /// Decorations: the selection and the IME's marked text.
     fn decorations(&self, cx: &App) -> HashMap<u64, Vec<(Range<usize>, Hsla)>> {
-        let mut out = HashMap::new();
+        let mut out: HashMap<u64, Vec<(Range<usize>, Hsla)>> = HashMap::new();
+        let selection = self.selection();
+        if !selection.is_empty() {
+            let color = cx.theme().selection;
+            let first = self.doc.blocks.partition_point(|b| b.end < selection.start);
+            for block in &self.doc.blocks[first..] {
+                if block.start > selection.end {
+                    break;
+                }
+                for leaf in &block.leaves {
+                    let src = leaf.src_range();
+                    let (lo, hi) = (block.start + src.start, block.start + src.end);
+                    if hi < selection.start || lo > selection.end {
+                        continue;
+                    }
+                    let rel = |x: usize| x.saturating_sub(block.start);
+                    let s = if selection.start <= lo {
+                        0
+                    } else {
+                        leaf.src_to_leaf(rel(selection.start))
+                    };
+                    let e = if selection.end >= hi {
+                        leaf.len()
+                    } else {
+                        leaf.src_to_leaf(rel(selection.end))
+                    };
+                    if e > s {
+                        out.entry(leaf.key).or_default().push((s..e, color));
+                    }
+                }
+            }
+        }
         if let Some(marked) = &self.marked
             && let (Some((b, l, s)), Some((_, _, e))) =
                 (self.doc.locate(marked.start), self.doc.locate(marked.end))
         {
             let key = self.doc.blocks[b].leaves[l].key;
-            out.insert(key, vec![(s..e.max(s), cx.theme().selection)]);
+            out.entry(key)
+                .or_default()
+                .push((s..e.max(s), cx.theme().selection));
         }
         out
     }
@@ -1043,7 +1175,7 @@ impl Render for VisualView {
             .flex()
             .justify_center()
             .child(div().w(px(680.)).max_w_full().h_full().px_4().child(list));
-        div()
+        let root = div()
             .id("visual-editor")
             .key_context(CONTEXT)
             .track_focus(&self.focus)
@@ -1055,17 +1187,26 @@ impl Render for VisualView {
                 this.perf.borrow_mut().input();
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| this.move_horizontal(false, cx)))
-            .on_action(cx.listener(|this, _: &MoveRight, _, cx| this.move_horizontal(true, cx)))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_vertical(false, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_vertical(true, cx)))
-            .on_action(cx.listener(|this, _: &MoveLineStart, _, cx| this.line_edge(false, cx)))
-            .on_action(cx.listener(|this, _: &MoveLineEnd, _, cx| this.line_edge(true, cx)))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_action(
+                cx.listener(|this, _: &MoveLeft, _, cx| this.move_horizontal(false, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MoveRight, _, cx| this.move_horizontal(true, false, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_vertical(false, false, cx)))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_vertical(true, false, cx)))
+            .on_action(
+                cx.listener(|this, _: &MoveLineStart, _, cx| this.line_edge(false, false, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MoveLineEnd, _, cx| this.line_edge(true, false, cx)))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.replay(true, window, cx)))
-            .on_action(cx.listener(|this, _: &Redo, window, cx| this.replay(false, window, cx)))
+            .on_action(cx.listener(|this, _: &Redo, window, cx| this.replay(false, window, cx)));
+        super::commands::listeners(root, cx)
             .child(Surface {
                 view: cx.entity(),
                 child: Some(page.into_any_element()),
