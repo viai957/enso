@@ -28,7 +28,7 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc, ti
 
 use gpui_kit::base::input::Rope;
 use gpui_kit::base::text::editor_host::{
-    BlockNode, FlowPosition, LeafGeometry, RenderContext, Table, collect_leaf_geometry,
+    BlockNode, FlowPosition, LeafGeometry, LinkMark, RenderContext, Table, collect_leaf_geometry,
 };
 use gpui_kit::component::{ActiveTheme as _, input::EditorState};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -137,6 +137,10 @@ pub struct VisualView {
     pub perf: Rc<RefCell<Perf>>,
     pub caret_blink: Caret,
     render_cx: RenderContext,
+    /// The document's folder, for relative images and links.
+    base: Option<std::path::PathBuf>,
+    /// The definitions `render_cx` resolves reference links with.
+    render_defs: String,
     /// The text and revision `doc` mirrors.
     synced_text: Rope,
     synced_revision: u64,
@@ -196,6 +200,8 @@ impl VisualView {
             perf: Rc::new(RefCell::new(Perf::from_env())),
             caret_blink: Caret::new(cx),
             render_cx,
+            base: None,
+            render_defs: String::new(),
             synced_text: text,
             synced_revision: revision,
             hint: None,
@@ -673,8 +679,18 @@ impl VisualView {
     /// Resolves relative image paths and opens links: relative to `base`
     /// (the document's folder), web and mail links in the browser.
     pub fn set_base(&mut self, base: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
-        let images = base.clone();
-        self.render_cx = RenderContext::from_app(cx)
+        self.base = base;
+        self.refresh_render_cx(cx);
+        cx.notify();
+    }
+
+    /// Rebuilds the render context: images and links resolved against
+    /// `base`, and reference links against the document's definitions, so
+    /// editing a definition updates its links everywhere.
+    fn refresh_render_cx(&mut self, cx: &App) {
+        let images = self.base.clone();
+        let base = self.base.clone();
+        let mut render_cx = RenderContext::from_app(cx)
             .with_body_font_size(px(BODY_SIZE))
             .with_image_source(move |uri| {
                 let source = uri.to_string();
@@ -683,7 +699,12 @@ impl VisualView {
                     _ => ImageSource::from(uri.clone()),
                 }
             })
-            .on_link_click(move |url, _, _, cx| {
+            .on_link_click(move |url, event, _, cx| {
+                // A click places the caret; Cmd-click (Ctrl elsewhere)
+                // follows the link, as in other editors.
+                if !event.modifiers().secondary(cx) {
+                    return;
+                }
                 if url.starts_with("https://")
                     || url.starts_with("http://")
                     || url.starts_with("mailto:")
@@ -696,7 +717,20 @@ impl VisualView {
                     cx.reveal_path(&base.join(url.as_ref()));
                 }
             });
-        cx.notify();
+        // Later inserts replace earlier ones: insert the first definition
+        // of an identifier last.
+        for (identifier, url, title) in self.doc.link_references().into_iter().rev() {
+            render_cx = render_cx.with_link_reference(
+                identifier.clone(),
+                LinkMark {
+                    url: url.into(),
+                    identifier: Some(identifier.into()),
+                    title: title.map(Into::into),
+                },
+            );
+        }
+        self.render_defs = self.doc.definitions().to_string();
+        self.render_cx = render_cx;
     }
 
     /// Moves the caret to `offset` (snapped to a caret stop), dropping the
@@ -874,8 +908,31 @@ impl VisualView {
                 .partial_cmp(&dist(b.1))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })?;
-        let index = g.index_for_position(at);
         let (bix, lix) = self.doc.leaf_by_key(key)?;
+        let text = &self.doc.blocks[bix].leaves[lix].text;
+        // GPUI's whole-layout hit test rounds an exact boundary up (issue
+        // 8): take the nearest of the neighbouring grapheme boundaries on
+        // the same visual line.
+        let index = g.index_for_position(at);
+        if index > text.len() || !text.is_char_boundary(index) {
+            return Some(self.doc.src_of(bix, lix, index));
+        }
+        let line_y = g.position_for_index(index).y;
+        let index = [
+            prev_boundary(text, index),
+            index,
+            next_boundary(text, index),
+        ]
+        .into_iter()
+        .map(|i| (i, g.position_for_index(i)))
+        .filter(|(_, p)| p.y == line_y)
+        .min_by(|a, b| {
+            (a.1.x - at.x)
+                .abs()
+                .partial_cmp(&(b.1.x - at.x).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(index, |(i, _)| i);
         Some(self.doc.src_of(bix, lix, index))
     }
 
@@ -1232,6 +1289,9 @@ impl Focusable for VisualView {
 impl Render for VisualView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.perf.borrow_mut().frame_begin();
+        if self.doc.definitions() != self.render_defs {
+            self.refresh_render_cx(cx);
+        }
         let theme = cx.theme();
         let list = list(self.list.clone(), cx.processor(Self::render_row))
             .w_full()
