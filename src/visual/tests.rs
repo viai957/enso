@@ -721,3 +721,94 @@ fn click(
     })
     .unwrap();
 }
+
+/// The top of the leaf holding source byte `src`, from the last frame.
+fn leaf_top(
+    cx: &mut TestAppContext,
+    view: &Entity<VisualView>,
+    src: usize,
+) -> Option<gpui_kit::Pixels> {
+    cx.update(|cx| {
+        let v = view.read(cx);
+        let (bix, lix, _) = v.doc.locate(src)?;
+        let key = v.doc.blocks[bix].leaves[lix].key;
+        let top = v.geometry.borrow().get(&key)?.bounds().top();
+        Some(top)
+    })
+}
+
+/// Typing that does not change a line count moves nothing on the page;
+/// a new paragraph moves only what is below it.
+#[gpui_kit::test]
+fn typing_does_not_shift_the_layout(cx: &mut TestAppContext) {
+    let doc: String = (0..12).map(|i| format!("Para {i} short.\n\n")).collect();
+    let (handle, view) = open(cx, &doc);
+    let starts: Vec<usize> = (0..12)
+        .map(|i| doc.find(&format!("Para {i} ")).unwrap())
+        .collect();
+    let tops = |cx: &mut TestAppContext, text: &str| -> Vec<gpui_kit::Pixels> {
+        (0..12)
+            .map(|i| {
+                let at = text.find(&format!("Para {i} ")).unwrap();
+                leaf_top(cx, &view, at).unwrap_or_else(|| {
+                    let n = cx.update(|cx| view.read(cx).geometry.borrow().len());
+                    let l = cx.update(|cx| view.read(cx).doc.locate(at));
+                    panic!("no geometry for {i} at {at}: {n} leaves, locate {l:?}")
+                })
+            })
+            .collect()
+    };
+    draw(cx, handle);
+    let before = tops(cx, &doc);
+    cx.update(|cx| view.update(cx, |v, _| v.caret = starts[5] + 7));
+    cx.simulate_input(handle, "xyz");
+    draw(cx, handle);
+    let text = source(cx, &view);
+    assert_eq!(tops(cx, &text), before, "typing in a line moves nothing");
+    cx.simulate_keystrokes(handle, "end enter");
+    cx.simulate_input(handle, "New");
+    draw(cx, handle);
+    let text = source(cx, &view);
+    let after = tops(cx, &text);
+    assert_eq!(after[..6], before[..6], "above and at the edit: still");
+    let shift = after[6] - before[6];
+    assert!(shift > px(10.), "below moves down by the new paragraph");
+    for i in 6..12 {
+        assert_eq!(after[i] - before[i], shift, "below moves together");
+    }
+}
+
+/// An edit above the viewport (made in the source) does not move what is
+/// on screen: the list stays anchored to the content in view.
+#[gpui_kit::test]
+fn edits_above_the_viewport_keep_the_view_anchored(cx: &mut TestAppContext) {
+    let doc: String = (0..200)
+        .map(|i| format!("Paragraph {i} of the anchored test.\n\n"))
+        .collect();
+    let (handle, view) = open(cx, &doc);
+    let target = doc.find("Paragraph 150 ").unwrap();
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(target, Some(px(300.)), cx)));
+    for _ in 0..3 {
+        draw(cx, handle);
+    }
+    let before = leaf_top(cx, &view, target).expect("in view");
+    // Five new paragraphs near the top, typed in the source.
+    let at = doc.find("Paragraph 3 ").unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        let editor = view.read(cx).editor.clone();
+        editor.update(cx, |e, cx| {
+            e.set_selected_range(at..at, cx);
+            e.replace(
+                "One.\n\nTwo.\n\nThree.\n\nFour.\n\nFive.\n\n".to_string(),
+                window,
+                cx,
+            );
+        });
+    })
+    .unwrap();
+    draw(cx, handle);
+    draw(cx, handle);
+    let moved = target + "One.\n\nTwo.\n\nThree.\n\nFour.\n\nFive.\n\n".len();
+    let after = leaf_top(cx, &view, moved).expect("still in view");
+    assert_eq!(after, before);
+}
