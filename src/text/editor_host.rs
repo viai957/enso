@@ -43,7 +43,7 @@ use super::{
 
 pub use super::node::{
     BlockNode, BlockState, CodeBlock, ColumnumnAlign as ColumnAlign, ImageNode, InlineNode,
-    LinkMark, Paragraph, Span, Table, TextMark,
+    LinkMark, Paragraph, SourceSegment, Span, Table, TextMark,
 };
 
 /// Parses Markdown with the parser [`TextView`](super::TextView) uses,
@@ -157,6 +157,33 @@ impl RenderContext {
     /// The text style blocks render with.
     pub fn style(&self) -> &TextViewStyle {
         &self.node.style
+    }
+}
+
+impl Table {
+    pub fn measure_column_widths(
+        &self,
+        render_context: &RenderContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<f32> {
+        let col_count = self
+            .children
+            .iter()
+            .map(|row| row.children.len())
+            .max()
+            .unwrap_or(0);
+        super::node::measure_table_columns(self, col_count, &render_context.node, window, cx)
+    }
+
+    pub fn chunk(mut self, header: bool, top: bool, bottom: bool, widths: Arc<Vec<f32>>) -> Self {
+        self.chunk = super::node::TableChunk {
+            header,
+            top,
+            bottom,
+            widths: Some(widths),
+        };
+        self
     }
 }
 

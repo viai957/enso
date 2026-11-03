@@ -3327,12 +3327,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         recorded
     }
 
-    pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.replay_history(true, window, cx);
     }
 
-    pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         self.replay_history(false, window, cx);
+    }
+
+    pub fn document_revision(&self) -> u64 {
+        self.document_revision
     }
 
     fn replay_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
