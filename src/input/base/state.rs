@@ -3327,12 +3327,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         recorded
     }
 
-    pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+    /// Undoes the last edit transaction, restoring its text and selections.
+    /// Hosts that render the text through their own view (not the `Editor`
+    /// element, which binds the `Undo` action) call this directly.
+    pub fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.replay_history(true, window, cx);
     }
 
-    pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+    /// Redoes the last undone transaction. See [`Self::undo`].
+    pub fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         self.replay_history(false, window, cx);
+    }
+
+    /// A counter that changes whenever the text changes, by any path: typing,
+    /// `replace`, undo, redo and `set_value` (which emits no
+    /// [`InputEvent::Change`]). Hosts that mirror the text compare it with the
+    /// value they last saw to know whether to resynchronize.
+    pub fn document_revision(&self) -> u64 {
+        self.document_revision
     }
 
     fn replay_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
