@@ -1,3 +1,8 @@
 /target/
 .DS_Store
 *.log
+
+# Third-party reference media gathered during research (Dinkus screenshots,
+# App Store images, demo videos). Kept locally for reference only: they are
+# not ours to redistribute. The written notes next to them are committed.
+research_notes/*/screenshots/
