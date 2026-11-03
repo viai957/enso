@@ -717,3 +717,13 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+#[test]
+fn spread_probe() {
+    for t in ["- a\n- b\n- c\n", "- a\n\n- b\n- c\n", "- a\n- b\n\n  more\n- c\n"] {
+        let Ok(Node::Root(r)) = markdown::to_mdast(t, &parse_options()) else { panic!() };
+        let Node::List(l) = &r.children[0] else { panic!() };
+        let items: Vec<bool> = l.children.iter().map(|c| match c { Node::ListItem(i) => i.spread, _ => false }).collect();
+        eprintln!("{t:?}: list.spread={} items={items:?}", l.spread);
+    }
+}
