@@ -53,7 +53,7 @@ gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
 # gpui-base 0.8.1 plus public undo/redo and a read-only document_revision, for
 # the visual editor. Pinned fork on this repository's `gpui-base-fork` branch;
 # see ENSO-PATCH.md there. Drop once GPUI Kit exposes the same APIs.
-gpui-base = { git = "https://github.com/viai957/enso", rev = "5f739b452c8d7e7cbe256772ccb513bc811a49fd" }
+gpui-base = { git = "https://github.com/viai957/enso", rev = "ba13470bc77e28c7ad2afbabc4c7b108569fa31d" }
 
 [features]
 ui-tests = ["dep:gpui-test"]

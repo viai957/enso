@@ -56,6 +56,10 @@ fn fresh_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(crate) fn fresh_id_for_experiment() -> u64 {
+    fresh_id()
+}
+
 /// What a block is, beyond its rendered node, for the edit fast paths.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {

@@ -3,6 +3,7 @@
 
 pub mod caret;
 pub mod document;
+pub mod gk_tree;
 mod input;
 pub mod mapping;
 pub mod perf;
