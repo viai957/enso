@@ -3,6 +3,7 @@
 
 mod build;
 pub mod caret;
+mod commands;
 pub mod document;
 mod input;
 pub mod mapping;

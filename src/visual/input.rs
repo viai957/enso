@@ -28,7 +28,7 @@ impl VisualView {
         if let Some(marked) = &self.marked {
             return marked.clone();
         }
-        range_utf16.map_or(self.caret..self.caret, |r| self.utf16_to_bytes(r, cx))
+        range_utf16.map_or_else(|| self.selection(), |r| self.utf16_to_bytes(r, cx))
     }
 }
 
@@ -52,8 +52,8 @@ impl EntityInputHandler for VisualView {
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.bytes_to_utf16(self.caret..self.caret, cx),
-            reversed: false,
+            range: self.bytes_to_utf16(self.selection(), cx),
+            reversed: self.anchor.is_some_and(|a| a > self.caret),
         })
     }
 

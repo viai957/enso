@@ -500,3 +500,133 @@ fn caret_deep_in_a_tall_block_is_revealed_and_typing_keeps_the_view(cx: &mut Tes
         "the view stays put while typing: {before:?} → {after:?}"
     );
 }
+
+fn select(cx: &mut TestAppContext, view: &Entity<VisualView>, range: std::ops::Range<usize>) {
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.anchor = Some(range.start);
+            v.caret = range.end;
+            cx.notify();
+        })
+    });
+}
+
+const MOD: &str = if cfg!(target_os = "macos") {
+    "cmd"
+} else {
+    "ctrl"
+};
+
+/// Shift-arrows grow a selection across hidden markers; copy puts the exact
+/// Markdown source on the clipboard; typing replaces the selection.
+#[gpui_kit::test]
+fn selection_copy_and_replace(cx: &mut TestAppContext) {
+    let doc = "Some **bold** text here.\n";
+    let (handle, view) = open(cx, doc);
+    let at = doc.find("bold").unwrap();
+    cx.update(|cx| view.update(cx, |v, _| v.caret = at - 3));
+    cx.simulate_keystrokes(
+        handle,
+        "shift-right shift-right shift-right shift-right shift-right",
+    );
+    draw(cx, handle);
+    let selection = cx.update(|cx| view.read(cx).selection());
+    let selected = &doc[selection.clone()];
+    assert!(selected.starts_with(" **bold"), "{selected:?}");
+    cx.simulate_keystrokes(handle, &format!("{MOD}-c"));
+    let clip = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));
+    assert_eq!(clip.as_deref(), Some(selected));
+    // A plain arrow collapses to the selection's edge.
+    cx.simulate_keystrokes(handle, "left");
+    cx.update(|cx| {
+        let v = view.read(cx);
+        assert_eq!((v.caret, v.anchor), (selection.start, None));
+    });
+    select(cx, &view, at..at + 4);
+    cx.simulate_input(handle, "z");
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), "Some **z** text here.\n");
+    // Backspace deletes a selection; select all then delete empties it.
+    cx.simulate_keystrokes(handle, &format!("{MOD}-a backspace"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), "");
+    assert_synced(cx, &view, "after deleting everything");
+}
+
+/// Formatting shortcuts toggle Markdown around the selection, touching only
+/// the bytes of the edited block, and undo as one step.
+#[gpui_kit::test]
+fn formatting_shortcuts_toggle_markdown(cx: &mut TestAppContext) {
+    let doc = "First paragraph.\n\nSecond word here.\n\nThird.\n";
+    let (handle, view) = open(cx, doc);
+    let at = doc.find("word").unwrap();
+    select(cx, &view, at..at + 4);
+    cx.simulate_keystrokes(handle, &format!("{MOD}-b"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), doc.replace("word", "**word**"));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-b"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), doc);
+    cx.simulate_keystrokes(handle, &format!("{MOD}-2"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), doc.replace("Second", "## Second"));
+    assert_synced(cx, &view, "after a heading toggle");
+    cx.simulate_keystrokes(handle, &format!("{MOD}-shift-8"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), doc.replace("Second", "- Second"));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-z"));
+    draw(cx, handle);
+    assert_eq!(source(cx, &view), doc.replace("Second", "## Second"));
+    assert_synced(cx, &view, "after undoing a list toggle");
+}
+
+/// Enter continues a list, a task list and a numbered list; enter on an
+/// empty item ends the list.
+#[gpui_kit::test]
+fn enter_continues_lists(cx: &mut TestAppContext) {
+    for (doc, typed, expected) in [
+        ("- one\n", "two", "- one\n- two\n"),
+        ("- [ ] one\n", "two", "- [ ] one\n- [ ] two\n"),
+        ("1. one\n", "two", "1. one\n2. two\n"),
+    ] {
+        let (handle, view) = open(cx, doc);
+        cx.update(|cx| view.update(cx, |v, _| v.caret = doc.len() - 1));
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, typed);
+        draw(cx, handle);
+        assert_eq!(source(cx, &view), expected);
+        assert_synced(cx, &view, "after continuing a list");
+        cx.simulate_keystrokes(handle, "enter enter");
+        draw(cx, handle);
+        let text = source(cx, &view);
+        assert!(text.starts_with(expected.trim_end()), "{text:?}");
+        assert!(
+            !text.trim_end().ends_with(['-', ']', '.']),
+            "the empty item ends the list: {text:?}"
+        );
+    }
+}
+
+/// Double click selects a word, triple click the whole paragraph, and a
+/// shift click extends.
+#[gpui_kit::test]
+fn word_and_paragraph_selection(cx: &mut TestAppContext) {
+    let doc = "Alpha beta gamma.\n\nNext.\n";
+    let (handle, view) = open(cx, doc);
+    let at = doc.find("beta").unwrap() + 1;
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.caret = at;
+            v.select_word(cx);
+        })
+    });
+    let selection = cx.update(|cx| view.read(cx).selection());
+    assert_eq!(&doc[selection], "beta");
+    cx.update(|cx| view.update(cx, |v, cx| v.select_paragraph(cx)));
+    let selection = cx.update(|cx| view.read(cx).selection());
+    assert_eq!(&doc[selection], "Alpha beta gamma.");
+    draw(cx, handle);
+    cx.update(|cx| {
+        assert!(view.read(cx).caret_position().is_some());
+    });
+}

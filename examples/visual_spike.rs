@@ -5,6 +5,9 @@
 //! ENSO_PERF=1 cargo run --release --example visual_spike -- file.md   # overlay
 //! ```
 
+#[path = "../src/markdown_edit.rs"]
+#[allow(dead_code)]
+mod markdown_edit;
 #[path = "../src/visual/mod.rs"]
 #[allow(dead_code)]
 mod visual;
