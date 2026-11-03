@@ -130,6 +130,9 @@ pub struct VisualView {
     /// the heights of blocks it has not measured, so one reveal can land
     /// short of a far block.
     pending_reveal: Option<(usize, u8)>,
+    /// Place the caret line this far below the viewport's top (a view
+    /// switch keeps the caret where it was on screen), with tries left.
+    pending_place: Option<(Pixels, u8)>,
     pub focus: FocusHandle,
     pub perf: Rc<RefCell<Perf>>,
     pub caret_blink: Caret,
@@ -188,6 +191,7 @@ impl VisualView {
             geometry: Rc::default(),
             pending_vertical: None,
             pending_reveal: None,
+            pending_place: None,
             focus: cx.focus_handle(),
             perf: Rc::new(RefCell::new(Perf::from_env())),
             caret_blink: Caret::new(cx),
@@ -664,6 +668,81 @@ impl VisualView {
         }
         self.goal_x = None;
         self.after_caret_change(cx);
+    }
+
+    /// Resolves relative image paths and opens links: relative to `base`
+    /// (the document's folder), web and mail links in the browser.
+    pub fn set_base(&mut self, base: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let images = base.clone();
+        self.render_cx = RenderContext::from_app(cx)
+            .with_body_font_size(px(BODY_SIZE))
+            .with_image_source(move |uri| {
+                let source = uri.to_string();
+                match &images {
+                    Some(base) if !source.contains(':') => ImageSource::from(base.join(source)),
+                    _ => ImageSource::from(uri.clone()),
+                }
+            })
+            .on_link_click(move |url, _, _, cx| {
+                if url.starts_with("https://")
+                    || url.starts_with("http://")
+                    || url.starts_with("mailto:")
+                {
+                    cx.open_url(url);
+                } else if !url.contains(':')
+                    && !url.starts_with('#')
+                    && let Some(base) = &base
+                {
+                    cx.reveal_path(&base.join(url.as_ref()));
+                }
+            });
+        cx.notify();
+    }
+
+    /// Moves the caret to `offset` (snapped to a caret stop), dropping the
+    /// selection. With `y`, the caret line is placed that far below the
+    /// viewport's top; otherwise it is revealed if hidden.
+    pub fn place_caret(&mut self, offset: usize, y: Option<Pixels>, cx: &mut Context<Self>) {
+        self.anchor = None;
+        self.marked = None;
+        self.goal_x = None;
+        self.caret = self.doc.snap(offset.min(self.synced_text.len()));
+        self.pending_reveal = None;
+        match (y, self.caret_row()) {
+            (Some(y), Some(row)) => {
+                self.list.scroll_to(ListOffset {
+                    item_ix: row,
+                    offset_in_item: px(0.),
+                });
+                self.pending_place = Some((y, 4));
+            }
+            _ => self.reveal_caret_if_hidden(),
+        }
+        self.caret_blink.reset(cx);
+        cx.notify();
+    }
+
+    /// How far below the viewport's top the caret line is, when it is in
+    /// view.
+    pub fn caret_viewport_y(&self) -> Option<Pixels> {
+        let viewport = self.list.viewport_bounds();
+        let (top, line_height, _) = self.caret_position()?;
+        (top.y >= viewport.top() && top.y + line_height <= viewport.bottom())
+            .then(|| top.y - viewport.top())
+    }
+
+    /// One step of placing the caret line at `y`. True when it is there.
+    fn place_caret_step(&mut self, y: Pixels) -> bool {
+        let viewport = self.list.viewport_bounds();
+        let Some((top, _, _)) = self.caret_position() else {
+            return false;
+        };
+        let delta = top.y - (viewport.top() + y);
+        if delta.abs() < px(1.) {
+            return true;
+        }
+        self.list.scroll_by(delta);
+        false
     }
 
     /// The window position, line height and caret height of the caret, from
@@ -1278,6 +1357,13 @@ impl Element for Surface {
                 && !view.reveal_caret_step(bix)
             {
                 view.pending_reveal = Some((bix, tries - 1));
+                cx.notify();
+            }
+            if let Some((y, tries)) = view.pending_place.take()
+                && tries > 0
+                && !view.place_caret_step(y)
+            {
+                view.pending_place = Some((y, tries - 1));
                 cx.notify();
             }
             if let Some(down) = view.pending_vertical.take() {
