@@ -1,0 +1,5 @@
+# Pinned so rustfmt and clippy agree across machines and CI. Bump on purpose,
+# then run `cargo fmt` in its own commit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
