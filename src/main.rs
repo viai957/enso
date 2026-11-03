@@ -128,6 +128,43 @@ impl Document {
 #[derive(Clone)]
 struct SidebarResize;
 
+/// The parts of the shell rendered as their own cached views.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Sidebar,
+    Header,
+    Status,
+}
+
+/// A cached view of one part of `Enso`'s shell. It holds no state: it renders
+/// through `Enso`, so the part's code and listeners stay `Enso`'s, and it is
+/// notified whenever `Enso` is.
+struct ShellPart {
+    app: WeakEntity<Enso>,
+    part: Part,
+    _observe: Subscription,
+    /// How often it rendered, for tests.
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl Render for ShellPart {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let part = self.part;
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.app
+            .update(cx, |app, cx| match part {
+                Part::Sidebar => app.render_sidebar_part(window, cx),
+                Part::Header => app.render_header_part(window, cx),
+                Part::Status => app.render_status_part(cx),
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
 /// An image pasted into a note: raw data (a screenshot) or a file copied in a
 /// file manager.
 enum PastedImage {
@@ -309,6 +346,8 @@ struct Enso {
     /// Counts document switches, to tell which documents were viewed last.
     view_clock: u64,
     warmed_doc: Option<EntityId>,
+    /// The shell's cached parts, created on first render.
+    parts: Vec<(Part, Entity<ShellPart>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -390,6 +429,7 @@ impl Enso {
             scrolled_to_tab: None,
             view_clock: 0,
             warmed_doc: None,
+            parts: Vec::new(),
             _subscriptions: vec![
                 subscription,
                 rename_subscription,
@@ -676,11 +716,16 @@ impl Enso {
                   event: &InputEvent,
                   cx: &mut Context<Self>| {
                 if matches!(event, InputEvent::Change) {
+                    // The shell only shows whether a document is unsaved:
+                    // notify on that change, not on every keystroke, so the
+                    // cached shell parts are not redrawn while typing.
+                    let mut became_dirty = false;
                     if let Some(doc) = this
                         .documents
                         .iter_mut()
                         .find(|d| d.editor.entity_id() == editor.entity_id())
                     {
+                        became_dirty = !doc.dirty;
                         doc.dirty = true;
                         doc.revision += 1;
                         if markdown
@@ -747,7 +792,9 @@ impl Enso {
                         this.schedule_save(index, cx);
                         this.schedule_word_count(index, false, cx);
                     }
-                    cx.notify();
+                    if became_dirty {
+                        cx.notify();
+                    }
                 }
             },
         );
@@ -1518,10 +1565,6 @@ impl Enso {
                 .unwrap_or_else(|| self.focus.clone());
             window.defer(cx, move |window, cx| focus.focus(window, cx));
         }
-        let mut rows = Vec::new();
-        if let Some(root) = &self.root {
-            self.tree_rows(root, &mut Vec::new(), &mut rows);
-        }
         let theme = cx.theme().clone();
         let backdrop = backdrop_visible(window, cx);
         let motion = theme.motion_tokens();
@@ -1535,7 +1578,6 @@ impl Enso {
         .clamp(0., 1.);
         let sidebar_width = self.sidebar_width;
 
-        let active_path = self.active.and_then(|i| self.documents[i].path.clone());
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
         let mode = if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
@@ -1543,6 +1585,412 @@ impl Enso {
             self.warmed_doc = active_doc;
             self.warm_documents(cx);
         }
+        let mut body = h_flex().flex_1().min_h_0().w_full();
+        if let Some(i) = self.active {
+            let document = &self.documents[i];
+            let mut editor_pane = None;
+            let mut reading_pane = None;
+            if mode != Mode::Read {
+                editor_pane = Some(
+                    div()
+                        .id(("editor-pane", document.editor.entity_id()))
+                        .when(document.markdown, |pane| {
+                            markdown_commands(pane, &document.editor)
+                        })
+                        .overflow_hidden()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .child(
+                            Editor::new(&document.editor)
+                                .bordered(false)
+                                .size_full()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .on_paste({
+                                    let weak = cx.entity().downgrade();
+                                    let editor = document.editor.clone();
+                                    move |item, window, cx| {
+                                        // Text pastes as usual. Image data (a screenshot)
+                                        // or image files (copied in Finder) are saved into
+                                        // the workspace and linked instead.
+                                        let mut images = Vec::new();
+                                        for entry in item.entries() {
+                                            match entry {
+                                                ClipboardEntry::Image(image) => {
+                                                    images.push(PastedImage::Data(image.clone()))
+                                                }
+                                                ClipboardEntry::ExternalPaths(paths) => images
+                                                    .extend(
+                                                        paths
+                                                            .paths()
+                                                            .iter()
+                                                            .filter(|p| files::is_image(p))
+                                                            .cloned()
+                                                            .map(PastedImage::File),
+                                                    ),
+                                                _ => {}
+                                            }
+                                        }
+                                        if images.is_empty() {
+                                            return false;
+                                        }
+                                        let editor = editor.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.paste_images(images, editor, window, cx)
+                                        });
+                                        true
+                                    }
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if mode != Mode::Edit {
+                if let Some(reader) = &document.large_reader {
+                    reading_pane = Some(
+                        div()
+                            .id(("preview-pane", document.editor.entity_id()))
+                            .overflow_hidden()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(reader.clone())
+                            .into_any_element(),
+                    );
+                } else {
+                    let base = document
+                        .path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .map(PathBuf::from);
+                    let link_base = base.clone();
+                    reading_pane = Some(
+                        div()
+                            .id(("preview-pane", document.editor.entity_id()))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(
+                                div().size_full().child(
+                                    // Spans the whole pane, like the editor, so its
+                                    // scrollbar sits at the pane's right edge. The
+                                    // padding is inside the scroll box: text starts
+                                    // where the editor's does (Read and Edit swap in
+                                    // place) and stops short of the overlaid bar.
+                                    TextView::new(&document.preview)
+                                        .selectable(true)
+                                        .scrollable(true)
+                                        .size_full()
+                                        .pl(px(reader::TEXT_INSET_X))
+                                        .pr_4()
+                                        .pt(px(reader::TEXT_INSET_Y))
+                                        .pb_8()
+                                        .image_source(move |uri| {
+                                            let source = uri.to_string();
+                                            if !source.contains(':') {
+                                                if let Some(base) = &base {
+                                                    return ImageSource::from(base.join(source));
+                                                }
+                                            }
+                                            ImageSource::from(uri.clone())
+                                        })
+                                        .on_link_click(move |url, event, _, cx| {
+                                            if event.is_right_click() {
+                                                return;
+                                            }
+                                            if url.starts_with("https://")
+                                                || url.starts_with("http://")
+                                                || url.starts_with("mailto:")
+                                            {
+                                                cx.open_url(url);
+                                            } else if !url.contains(':') && !url.starts_with('#') {
+                                                if let Some(base) = &link_base {
+                                                    cx.reveal_path(&base.join(url.as_ref()));
+                                                }
+                                            }
+                                        }),
+                                ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+            // Read and Edit have independent element paths. Only Split owns
+            // resizable state, so switching modes never reuses panel zero for
+            // a different kind of document view or its cached draw state.
+            body = match (editor_pane, reading_pane) {
+                (Some(editor), Some(reader)) => body.child(
+                    h_resizable(("document-split", document.editor.entity_id()))
+                        .child(
+                            resizable_panel()
+                                .size_range(px(180.)..Pixels::MAX)
+                                .child(editor),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(px(180.)..Pixels::MAX)
+                                .child(reader),
+                        ),
+                ),
+                (Some(editor), None) => body.child(editor),
+                (None, Some(reader)) => body.child(reader),
+                (None, None) => body,
+            };
+        } else {
+            body = body.child(
+                v_flex()
+                    .id("empty-workspace")
+                    .size_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .p_6()
+                    .gap_5()
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(brand::logo(104., cx))
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("enso"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Open a file, find a thought, or start something new."),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("start-open")
+                                    .small()
+                                    .icon(IconName::File)
+                                    .label("Open file")
+                                    .on_click(
+                                        cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("start-folder")
+                                    .small()
+                                    .icon(IconName::FolderOpen)
+                                    .label("Open folder")
+                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
+                            )
+                            .child(
+                                Button::new("start-new")
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .label("New note")
+                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
+                            ),
+                    ),
+            );
+        }
+        let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
+            let toggle_label = if self.sidebar_open {
+                "Collapse sidebar"
+            } else {
+                "Expand sidebar"
+            };
+            // Keeps the document header lined up with the content column as the
+            // sidebar opens, closes and resizes beneath the title bar.
+            let toggle_width = 28.;
+            let header_offset = (f32::from(sidebar_width) * sidebar_reveal
+                - TRAFFIC_LIGHTS_WIDTH
+                - toggle_width
+                - 8.)
+                .max(0.);
+            // Transparent and borderless: it floats over the sidebar and the
+            // content's own top strip, which draws the only horizontal border.
+            let titlebar = TitleBar::new()
+                .h(px(TITLEBAR_HEIGHT))
+                .bg(gpui_kit::transparent_black())
+                .border_color(gpui_kit::transparent_black())
+                // Laid out on top of the bar rather than in it, so a full tab
+                // strip scrolls within the window instead of widening the bar.
+                .child(
+                    div().absolute().inset_0().child(
+                        h_flex()
+                            .size_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .pr_2()
+                            .child(
+                                // The title bar starts a window move on any press
+                                // that then moves; keep presses on the toggle to
+                                // itself so a slightly shaky click still toggles.
+                                div()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        Button::new("toggle-sidebar")
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::PanelLeft)
+                                            .tooltip(toggle_label)
+                                            .accessibility_label(toggle_label)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sidebar_open = !this.sidebar_open;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().flex_shrink_0().w(px(header_offset)))
+                            .child(self.part(Part::Header, cx)),
+                    ),
+                );
+            (Some(titlebar.into_any_element()), None)
+        } else {
+            (None, Some(self.part(Part::Header, cx)))
+        };
+        v_flex()
+            .id("enso")
+            .key_context("Enso")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            // Over a translucent backdrop the window itself stays clear; the
+            // content column paints its own opaque background.
+            .when(!backdrop, |view| view.bg(theme.background))
+            .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
+            .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
+            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            // Closes the current tab; with no tabs left, the window, as Cmd-W
+            // does in other Mac apps (and quits after the last window).
+            .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
+                if this.active.is_some() {
+                    this.close_current_file(cx);
+                } else {
+                    this.request_close(CloseTarget::Window, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
+            // Only when the tree itself has focus: a text field passes Enter
+            // and Cmd-Backspace on to here after handling them, and acting
+            // again would reset a rename in progress (or delete a file).
+            .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
+                    Some(path) => this.start_rename(path, w, cx),
+                    None => cx.propagate(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
+                    Some(path) => this.delete_entry(path, cx),
+                    None => cx.propagate(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
+                let next = if this.mode == Mode::Edit {
+                    Mode::Read
+                } else {
+                    Mode::Edit
+                };
+                this.set_mode(next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                let next = if this.mode == Mode::Split {
+                    this.previous_mode
+                } else {
+                    Mode::Split
+                };
+                this.set_mode(next, window, cx);
+            }))
+            .child(
+                div().flex_1().min_h_0().w_full().child(
+                    h_flex()
+                        .id("workspace-panels")
+                        .size_full()
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<SidebarResize>, _, cx| {
+                                if !this.sidebar_open {
+                                    return;
+                                }
+                                // The sidebar starts at the panels' left edge, so the
+                                // pointer's offset from it is the new width.
+                                let width = (event.event.position.x - event.bounds.left())
+                                    .clamp(px(160.), px(480.));
+                                if this.sidebar_width != width {
+                                    this.sidebar_width = width;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("sidebar-viewport")
+                                .relative()
+                                .h_full()
+                                .flex_shrink_0()
+                                .w(sidebar_width * sidebar_reveal)
+                                .overflow_hidden()
+                                .when(sidebar_reveal <= 0.001, |sidebar| sidebar.invisible())
+                                .child(
+                                    div()
+                                        .w(sidebar_width)
+                                        .h_full()
+                                        .child(self.part(Part::Sidebar, cx)),
+                                )
+                                .when(self.sidebar_open && sidebar_reveal >= 0.999, |sidebar| {
+                                    sidebar.child(
+                                        resize_handle("sidebar-resize", Axis::Horizontal)
+                                            .inside(HandleEdge::Trailing)
+                                            .on_drag(SidebarResize, |_, _, _, cx| {
+                                                cx.new(|_| SidebarResize)
+                                            }),
+                                    )
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .bg(content_background(window, cx))
+                                // Room for the floating title bar; its bottom
+                                // border stops at the sidebar.
+                                .when(custom_titlebar.is_some(), |view| {
+                                    view.child(
+                                        div()
+                                            .h(px(TITLEBAR_HEIGHT))
+                                            .flex_shrink_0()
+                                            .border_b_1()
+                                            .border_color(theme.border),
+                                    )
+                                })
+                                .when_some(standard_header, |view, header| view.child(header))
+                                .child(body)
+                                .child(self.part(Part::Status, cx)),
+                        ),
+                ),
+            )
+            .when_some(custom_titlebar, |view, titlebar| {
+                view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
+            })
+    }
+
+    /// The tab strip and view buttons: a cached part, see [`ShellPart`].
+    fn render_header_part(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("header");
+        let theme = cx.theme().clone();
+        let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
+        let mode = if markdown { self.mode } else { Mode::Edit };
         // Bring a newly active tab into view, once, so scrolling away stays put.
         // From the last frame's layout (tab bounds there exclude the scroll
         // offset); a tab not laid out yet is revealed on the next frame.
@@ -1689,6 +2137,61 @@ impl Enso {
                     ),
             );
         }
+        // The tab strip and view buttons: in Enso's title bar on macOS and
+        // Windows, a bar of the same shape under the native one on Linux.
+        let document_header = h_flex()
+            // Fills its cached part's box (see `Enso::part`).
+            .size_full()
+            .h(px(44.))
+            // Fills the title bar's width beside the toggle; as a row of the
+            // content column (Linux) it keeps its height instead of growing.
+            .when(CUSTOM_TITLEBAR, |header| header.flex_1())
+            .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
+            .min_w_0()
+            .px_2()
+            .gap_2()
+            .items_center()
+            .when(!CUSTOM_TITLEBAR, |header| {
+                header.border_b_1().border_color(theme.border)
+            })
+            .child(tabs)
+            .child(
+                h_flex().gap_1().items_center().flex_shrink_0().children(
+                    [
+                        (Mode::Read, "Read", IconName::BookOpen),
+                        (Mode::Edit, "Edit", IconName::Pencil),
+                        (Mode::Split, "Split", IconName::Columns2),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (value, label, icon))| {
+                        Button::new(("mode", i))
+                            .ghost()
+                            .small()
+                            .icon(icon)
+                            .tooltip(label)
+                            .accessibility_label(label)
+                            .disabled(!markdown || self.active.is_none())
+                            .when(mode == value, |b| b.bg(theme.secondary))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_mode(value, window, cx)
+                            }))
+                    }),
+                ),
+            );
+        document_header.into_any_element()
+    }
+
+    /// The workspace switcher, file tree and sidebar footer: a cached part.
+    fn render_sidebar_part(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("sidebar");
+        let mut rows = Vec::new();
+        if let Some(root) = &self.root {
+            self.tree_rows(root, &mut Vec::new(), &mut rows);
+        }
+        let theme = cx.theme().clone();
+        let backdrop = backdrop_visible(window, cx);
+        let active_path = self.active.and_then(|i| self.documents[i].path.clone());
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
         let switcher = {
             let weak = cx.entity().downgrade();
@@ -2254,474 +2757,88 @@ impl Enso {
                         .on_click(|_, _, cx| settings::open(cx)),
                 ),
             );
+        sidebar.into_any_element()
+    }
 
-        let mut body = h_flex().flex_1().min_h_0().w_full();
-        if let Some(i) = self.active {
-            let document = &self.documents[i];
-            let mut editor_pane = None;
-            let mut reading_pane = None;
-            if mode != Mode::Read {
-                editor_pane = Some(
-                    div()
-                        .id(("editor-pane", document.editor.entity_id()))
-                        .when(document.markdown, |pane| {
-                            markdown_commands(pane, &document.editor)
-                        })
-                        .overflow_hidden()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .border_r_1()
-                        .border_color(theme.border)
-                        .child(
-                            Editor::new(&document.editor)
-                                .bordered(false)
-                                .size_full()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_sm()
-                                .on_paste({
-                                    let weak = cx.entity().downgrade();
-                                    let editor = document.editor.clone();
-                                    move |item, window, cx| {
-                                        // Text pastes as usual. Image data (a screenshot)
-                                        // or image files (copied in Finder) are saved into
-                                        // the workspace and linked instead.
-                                        let mut images = Vec::new();
-                                        for entry in item.entries() {
-                                            match entry {
-                                                ClipboardEntry::Image(image) => {
-                                                    images.push(PastedImage::Data(image.clone()))
-                                                }
-                                                ClipboardEntry::ExternalPaths(paths) => images
-                                                    .extend(
-                                                        paths
-                                                            .paths()
-                                                            .iter()
-                                                            .filter(|p| files::is_image(p))
-                                                            .cloned()
-                                                            .map(PastedImage::File),
-                                                    ),
-                                                _ => {}
-                                            }
-                                        }
-                                        if images.is_empty() {
-                                            return false;
-                                        }
-                                        let editor = editor.clone();
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.paste_images(images, editor, window, cx)
-                                        });
-                                        true
-                                    }
-                                }),
-                        )
-                        .into_any_element(),
-                );
-            }
-            if mode != Mode::Edit {
-                if let Some(reader) = &document.large_reader {
-                    reading_pane = Some(
-                        div()
-                            .id(("preview-pane", document.editor.entity_id()))
-                            .overflow_hidden()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(reader.clone())
-                            .into_any_element(),
-                    );
-                } else {
-                    let base = document
-                        .path
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .map(PathBuf::from);
-                    let link_base = base.clone();
-                    reading_pane = Some(
-                        div()
-                            .id(("preview-pane", document.editor.entity_id()))
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(
-                                div().size_full().child(
-                                    // Spans the whole pane, like the editor, so its
-                                    // scrollbar sits at the pane's right edge. The
-                                    // padding is inside the scroll box: text starts
-                                    // where the editor's does (Read and Edit swap in
-                                    // place) and stops short of the overlaid bar.
-                                    TextView::new(&document.preview)
-                                        .selectable(true)
-                                        .scrollable(true)
-                                        .size_full()
-                                        .pl(px(reader::TEXT_INSET_X))
-                                        .pr_4()
-                                        .pt(px(reader::TEXT_INSET_Y))
-                                        .pb_8()
-                                        .image_source(move |uri| {
-                                            let source = uri.to_string();
-                                            if !source.contains(':') {
-                                                if let Some(base) = &base {
-                                                    return ImageSource::from(base.join(source));
-                                                }
-                                            }
-                                            ImageSource::from(uri.clone())
-                                        })
-                                        .on_link_click(move |url, event, _, cx| {
-                                            if event.is_right_click() {
-                                                return;
-                                            }
-                                            if url.starts_with("https://")
-                                                || url.starts_with("http://")
-                                                || url.starts_with("mailto:")
-                                            {
-                                                cx.open_url(url);
-                                            } else if !url.contains(':') && !url.starts_with('#') {
-                                                if let Some(base) = &link_base {
-                                                    cx.reveal_path(&base.join(url.as_ref()));
-                                                }
-                                            }
-                                        }),
-                                ),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
-            // Read and Edit have independent element paths. Only Split owns
-            // resizable state, so switching modes never reuses panel zero for
-            // a different kind of document view or its cached draw state.
-            body = match (editor_pane, reading_pane) {
-                (Some(editor), Some(reader)) => body.child(
-                    h_resizable(("document-split", document.editor.entity_id()))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(editor),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(reader),
-                        ),
-                ),
-                (Some(editor), None) => body.child(editor),
-                (None, Some(reader)) => body.child(reader),
-                (None, None) => body,
-            };
-        } else {
-            body = body.child(
-                v_flex()
-                    .id("empty-workspace")
-                    .size_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_center()
-                    .p_6()
-                    .gap_5()
-                    .child(
-                        v_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(brand::logo(104., cx))
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("enso"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Open a file, find a thought, or start something new."),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("start-open")
-                                    .small()
-                                    .icon(IconName::File)
-                                    .label("Open file")
-                                    .on_click(
-                                        cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("start-folder")
-                                    .small()
-                                    .icon(IconName::FolderOpen)
-                                    .label("Open folder")
-                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
-                            )
-                            .child(
-                                Button::new("start-new")
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .label("New note")
-                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
-                            ),
-                    ),
-            );
-        }
-        // The tab strip and view buttons: in Enso's title bar on macOS and
-        // Windows, a bar of the same shape under the native one on Linux.
-        let document_header = h_flex()
-            .h(px(44.))
-            // Fills the title bar's width beside the toggle; as a row of the
-            // content column (Linux) it keeps its height instead of growing.
-            .when(CUSTOM_TITLEBAR, |header| header.flex_1())
-            .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
-            .min_w_0()
-            .px_2()
-            .gap_2()
-            .items_center()
-            .when(!CUSTOM_TITLEBAR, |header| {
-                header.border_b_1().border_color(theme.border)
-            })
-            .child(tabs)
-            .child(
-                h_flex().gap_1().items_center().flex_shrink_0().children(
-                    [
-                        (Mode::Read, "Read", IconName::BookOpen),
-                        (Mode::Edit, "Edit", IconName::Pencil),
-                        (Mode::Split, "Split", IconName::Columns2),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (value, label, icon))| {
-                        Button::new(("mode", i))
-                            .ghost()
-                            .small()
-                            .icon(icon)
-                            .tooltip(label)
-                            .accessibility_label(label)
-                            .disabled(!markdown || self.active.is_none())
-                            .when(mode == value, |b| b.bg(theme.secondary))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_mode(value, window, cx)
-                            }))
-                    }),
-                ),
-            );
-        let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
-            let toggle_label = if self.sidebar_open {
-                "Collapse sidebar"
-            } else {
-                "Expand sidebar"
-            };
-            // Keeps the document header lined up with the content column as the
-            // sidebar opens, closes and resizes beneath the title bar.
-            let toggle_width = 28.;
-            let header_offset = (f32::from(sidebar_width) * sidebar_reveal
-                - TRAFFIC_LIGHTS_WIDTH
-                - toggle_width
-                - 8.)
-                .max(0.);
-            // Transparent and borderless: it floats over the sidebar and the
-            // content's own top strip, which draws the only horizontal border.
-            let titlebar = TitleBar::new()
-                .h(px(TITLEBAR_HEIGHT))
-                .bg(gpui_kit::transparent_black())
-                .border_color(gpui_kit::transparent_black())
-                // Laid out on top of the bar rather than in it, so a full tab
-                // strip scrolls within the window instead of widening the bar.
-                .child(
-                    div().absolute().inset_0().child(
-                        h_flex()
-                            .size_full()
-                            .min_w_0()
-                            .items_center()
-                            .gap_2()
-                            .pr_2()
-                            .child(
-                                // The title bar starts a window move on any press
-                                // that then moves; keep presses on the toggle to
-                                // itself so a slightly shaky click still toggles.
-                                div()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .child(
-                                        Button::new("toggle-sidebar")
-                                            .ghost()
-                                            .small()
-                                            .icon(IconName::PanelLeft)
-                                            .tooltip(toggle_label)
-                                            .accessibility_label(toggle_label)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.sidebar_open = !this.sidebar_open;
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .child(div().flex_shrink_0().w(px(header_offset)))
-                            .child(document_header),
-                    ),
-                );
-            (Some(titlebar.into_any_element()), None)
-        } else {
-            (None, Some(document_header.into_any_element()))
-        };
+    /// The status bar: word count and transient errors. A cached part.
+    fn render_status_part(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("status");
+        let theme = cx.theme().clone();
         let stats = self
             .active
             .map(|i| self.documents[i].stats.clone())
             .unwrap_or_default();
-        v_flex()
-            .id("enso")
-            .key_context("Enso")
-            .track_focus(&self.focus)
+        h_flex()
             .relative()
-            .size_full()
-            // Over a translucent backdrop the window itself stays clear; the
-            // content column paints its own opaque background.
-            .when(!backdrop, |view| view.bg(theme.background))
-            .text_color(theme.foreground)
-            .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
-            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
-            .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
-            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
-            // Closes the current tab; with no tabs left, the window, as Cmd-W
-            // does in other Mac apps (and quits after the last window).
-            .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
-                if this.active.is_some() {
-                    this.close_current_file(cx);
-                } else {
-                    this.request_close(CloseTarget::Window, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
-            // Only when the tree itself has focus: a text field passes Enter
-            // and Cmd-Backspace on to here after handling them, and acting
-            // again would reset a rename in progress (or delete a file).
-            .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
-                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.start_rename(path, w, cx),
-                    None => cx.propagate(),
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
-                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.delete_entry(path, cx),
-                    None => cx.propagate(),
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
-                let next = if this.mode == Mode::Edit {
-                    Mode::Read
-                } else {
-                    Mode::Edit
-                };
-                this.set_mode(next, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
-                let next = if this.mode == Mode::Split {
-                    this.previous_mode
-                } else {
-                    Mode::Split
-                };
-                this.set_mode(next, window, cx);
-            }))
-            .child(
-                div().flex_1().min_h_0().w_full().child(
-                    h_flex()
-                        .id("workspace-panels")
-                        .size_full()
-                        .on_drag_move(cx.listener(
-                            |this, event: &DragMoveEvent<SidebarResize>, _, cx| {
-                                if !this.sidebar_open {
-                                    return;
-                                }
-                                // The sidebar starts at the panels' left edge, so the
-                                // pointer's offset from it is the new width.
-                                let width = (event.event.position.x - event.bounds.left())
-                                    .clamp(px(160.), px(480.));
-                                if this.sidebar_width != width {
-                                    this.sidebar_width = width;
-                                    cx.notify();
-                                }
-                            },
-                        ))
-                        .child(
-                            div()
-                                .id("sidebar-viewport")
-                                .relative()
-                                .h_full()
-                                .flex_shrink_0()
-                                .w(sidebar_width * sidebar_reveal)
-                                .overflow_hidden()
-                                .when(sidebar_reveal <= 0.001, |sidebar| sidebar.invisible())
-                                .child(div().w(sidebar_width).h_full().child(sidebar))
-                                .when(self.sidebar_open && sidebar_reveal >= 0.999, |sidebar| {
-                                    sidebar.child(
-                                        resize_handle("sidebar-resize", Axis::Horizontal)
-                                            .inside(HandleEdge::Trailing)
-                                            .on_drag(SidebarResize, |_, _, _, cx| {
-                                                cx.new(|_| SidebarResize)
-                                            }),
-                                    )
-                                }),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .bg(content_background(window, cx))
-                                // Room for the floating title bar; its bottom
-                                // border stops at the sidebar.
-                                .when(custom_titlebar.is_some(), |view| {
-                                    view.child(
-                                        div()
-                                            .h(px(TITLEBAR_HEIGHT))
-                                            .flex_shrink_0()
-                                            .border_b_1()
-                                            .border_color(theme.border),
-                                    )
-                                })
-                                .when_some(standard_header, |view, header| view.child(header))
-                                .child(body)
-                                .child(
-                                    h_flex()
-                                        .relative()
-                                        .h(px(20.))
-                                        .flex_shrink_0()
-                                        .items_center()
-                                        .overflow_hidden()
-                                        .px_3()
-                                        .py_0()
-                                        .gap_3()
-                                        .justify_end()
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .text_size(px(10.))
-                                        .line_height(relative(1.))
-                                        .when(self.error && self.error_shown, |bar| {
-                                            bar.child(
-                                                div()
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(theme.danger)
-                                                    .child(self.status.clone()),
-                                            )
-                                        })
-                                        .child(
-                                            div().text_color(theme.muted_foreground).child(stats),
-                                        ),
-                                ),
-                        ),
-                ),
-            )
-            .when_some(custom_titlebar, |view, titlebar| {
-                view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
+            .w_full()
+            .h(px(20.))
+            .flex_shrink_0()
+            .items_center()
+            .overflow_hidden()
+            .px_3()
+            .py_0()
+            .gap_3()
+            .justify_end()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_size(px(10.))
+            .line_height(relative(1.))
+            .when(self.error && self.error_shown, |bar| {
+                bar.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.danger)
+                        .child(self.status.clone()),
+                )
             })
+            .child(div().text_color(theme.muted_foreground).child(stats))
+            .into_any_element()
+    }
+
+    /// A shell part as a cached view: it renders, lays out and paints again
+    /// only when `Enso` notifies (its state changed), not on every frame the
+    /// window draws (typing in the document redraws the window).
+    fn part(&mut self, part: Part, cx: &mut Context<Self>) -> AnyElement {
+        let view = match self.parts.iter().find(|(p, _)| *p == part) {
+            Some((_, view)) => view.clone(),
+            None => {
+                let app = cx.entity().downgrade();
+                let enso = cx.entity();
+                let view = cx.new(|cx| {
+                    let observe = cx.observe(&enso, |_, _, cx| cx.notify());
+                    ShellPart {
+                        app,
+                        part,
+                        _observe: observe,
+                        #[cfg(test)]
+                        renders: 0,
+                    }
+                });
+                self.parts.push((part, view.clone()));
+                view
+            }
+        };
+        // The cached view's own box takes the part's outer size; the part
+        // lays itself out inside it.
+        let style = match part {
+            Part::Sidebar => StyleRefinement::default().size_full(),
+            Part::Header if CUSTOM_TITLEBAR => {
+                StyleRefinement::default().flex_1().min_w_0().h(px(44.))
+            }
+            Part::Header => StyleRefinement::default()
+                .w_full()
+                .flex_shrink_0()
+                .h(px(44.)),
+            Part::Status => StyleRefinement::default()
+                .w_full()
+                .flex_shrink_0()
+                .h(px(20.)),
+        };
+        AnyView::from(view).cached(style).into_any_element()
     }
 }
 
@@ -3653,5 +3770,76 @@ mod transition_tests {
             assert!(view.read(cx).active.is_none());
         });
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    /// Typing in a document redraws the window but not the shell's cached
+    /// parts: they render again only when the shell's own state changes
+    /// (here: the document becoming unsaved, and the word count).
+    #[gpui_kit::test]
+    fn typing_does_not_rerender_the_shell_parts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(
+                        Some(PathBuf::from("note.md")),
+                        "hello".into(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    view.mode = Mode::Edit;
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(5..5, cx));
+        })
+        .unwrap();
+        // Draw as the platform's frame loop does: no forced refresh, which
+        // would re-render every view.
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        frame(cx);
+        let renders = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                view.read(cx)
+                    .parts
+                    .iter()
+                    .map(|(part, v)| (*part, v.read(cx).renders))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = renders(cx);
+        for _ in 0..30 {
+            cx.simulate_input(handle, "x");
+            frame(cx);
+        }
+        let after = renders(cx);
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).value().to_string()),
+            format!("hello{}", "x".repeat(30))
+        );
+        assert_eq!(before.len(), 3, "all three parts are cached views");
+        for ((part, b), (_, a)) in before.iter().zip(&after) {
+            // Once when the document becomes unsaved, once for the word
+            // count's status: a constant, not one per keystroke.
+            assert!(
+                a - b <= 2,
+                "{part:?} rendered {} times for 30 keystrokes",
+                a - b
+            );
+        }
     }
 }
