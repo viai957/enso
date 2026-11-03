@@ -264,6 +264,8 @@ fn main() {
     };
     let text = corpus(target);
     let _ = std::fs::create_dir_all("target/bench");
+    // The corpus, for opening by hand (docs/macos-qa.md).
+    let _ = std::fs::write(format!("target/bench/{size_arg}.md"), &text);
     let log = format!("target/bench/{size_arg}.jsonl");
     let _ = std::fs::remove_file(&log);
     // SAFETY: set before any thread reads the environment.
@@ -283,14 +285,20 @@ fn main() {
             };
             let opened = Instant::now();
             let len = text.len();
+            let mut editor_time = Duration::ZERO;
+            let mut view_time = Duration::ZERO;
             let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
+                let t = Instant::now();
                 let editor = cx.new(|cx| {
                     EditorState::new(window, cx)
                         .language("markdown")
                         .folding(false)
                         .default_value(text)
                 });
+                editor_time = t.elapsed();
+                let t = Instant::now();
                 let view = cx.new(|cx| VisualView::new(editor, window, cx));
+                view_time = t.elapsed();
                 view.update(cx, |view, cx| window.focus(&view.focus, cx));
                 view
             })
@@ -315,8 +323,10 @@ fn main() {
                     cx.background_executor().timer(Duration::from_millis(2)).await;
                 }
                 println!(
-                    "\nOpen {size_arg} ({len} bytes): view constructed {:.1} ms (main thread), first frame {:.1} ms, fully parsed {:.1} ms",
+                    "\nOpen {size_arg} ({len} bytes): main thread {:.1} ms (EditorState {:.1} ms, VisualView {:.1} ms), first frame {:.1} ms, fully parsed {:.1} ms",
                     ms(constructed),
+                    ms(editor_time),
+                    ms(view_time),
                     first_frame.map_or(f64::NAN, ms),
                     loaded.map_or(f64::NAN, ms),
                 );
