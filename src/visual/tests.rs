@@ -221,11 +221,9 @@ fn assert_synced(cx: &mut TestAppContext, view: &Entity<VisualView>, what: &str)
         );
         let text = v.editor.read(cx).text().to_string();
         super::document::tests::assert_matches_full_parse(&v.doc, &text, what);
-        assert_eq!(
-            v.list.item_count(),
-            v.doc.blocks.len(),
-            "{what}: list items"
-        );
+        assert_eq!(v.list.item_count(), v.rows.len(), "{what}: list items");
+        let fresh = super::rows::Rows::build(&v.doc);
+        assert_eq!(v.rows.rows, fresh.rows, "{what}: rows");
     });
 }
 
@@ -320,6 +318,7 @@ fn mixed_edits_keep_the_index_in_sync(cx: &mut TestAppContext) {
         + &(0..40).map(|i| format!("- item {i}\n")).collect::<String>()
         + "\n```\ncode\n```\n";
     let (handle, view) = open(cx, &base);
+    assert_synced(cx, &view, "after open");
     let pieces = [
         "x",
         "中",

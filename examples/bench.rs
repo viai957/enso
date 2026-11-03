@@ -419,7 +419,7 @@ fn main() {
                             let start = cx.update(|cx| view.read(cx).perf.borrow().frames.len());
                             let _ = handle.update(cx, |_, window, cx| {
                                 view.update(cx, |v, cx| {
-                                    let n = v.doc.blocks.len();
+                                    let n = v.list.item_count();
                                     v.list.scroll_to_reveal_item(n.saturating_sub(1));
                                     cx.notify();
                                 });

@@ -24,19 +24,21 @@
 //! edits since are diffed and applied to the result before it is merged, so
 //! input is never dropped and no stale result is shown.
 
-use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::base::input::Rope;
 use gpui_kit::base::text::editor_host::{
-    BlockNode, FlowPosition, LeafGeometry, RenderContext, collect_leaf_geometry,
+    BlockNode, FlowPosition, LeafGeometry, RenderContext, Table, collect_leaf_geometry,
 };
 use gpui_kit::component::{ActiveTheme as _, input::EditorState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::caret::Caret;
-use super::document::{self, EditResult, VisualDocument};
+use super::document::{self, EditResult, Kind, VisualDocument};
 use super::perf::{Perf, ms};
+use super::rows::Rows;
 
 actions!(
     visual_editor,
@@ -59,6 +61,10 @@ pub const CONTEXT: &str = "VisualEditor";
 
 /// How much of a document is parsed on the main thread when it opens.
 pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
+
+/// The page's body text size (placeholder token until the design reference
+/// sets it).
+pub const BODY_SIZE: f32 = 17.;
 
 /// How long typing must pause before the background whole parse that
 /// settles the index runs.
@@ -133,6 +139,14 @@ pub struct VisualView {
     scroll_history: Vec<(usize, ListOffset)>,
     /// Paths and sizes of the last sync, for tests and the overlay.
     pub last_edit: Option<EditResult>,
+    /// The list's rows: blocks, with long lists and tables in slices.
+    pub rows: Rows,
+    /// Column widths of long tables rendered in slices, by block id: the row
+    /// count they were measured for, and the widths. Edited rows widen them
+    /// incrementally (see `table_dirty`).
+    table_widths: HashMap<u64, (usize, Arc<Vec<f32>>)>,
+    /// Rows edited since the widths were measured, by block id.
+    table_dirty: HashMap<u64, Vec<usize>>,
     _observe: Subscription,
 }
 
@@ -148,8 +162,9 @@ impl VisualView {
         let source = text.to_string();
         let cut = document::prefix_cut(&source, OPEN_PREFIX_BYTES);
         let doc = VisualDocument::from_blocks(document::parse_blocks(&source[..cut], 0), &text);
-        let list = ListState::new(doc.blocks.len(), ListAlignment::Top, px(600.));
-        let render_cx = RenderContext::from_app(cx).with_body_font_size(px(17.));
+        let rows = Rows::build(&doc);
+        let list = ListState::new(rows.len(), ListAlignment::Top, px(600.));
+        let render_cx = RenderContext::from_app(cx).with_body_font_size(px(BODY_SIZE));
         let caret = doc
             .blocks
             .iter()
@@ -176,6 +191,9 @@ impl VisualView {
             background: Background::default(),
             scroll_history: Vec::new(),
             last_edit: None,
+            rows,
+            table_widths: HashMap::new(),
+            table_dirty: HashMap::new(),
             _observe: observe,
         };
         if cut < source.len() {
@@ -224,7 +242,12 @@ impl VisualView {
             return;
         };
         let result = self.doc.edit(&self.synced_text, old.clone(), new_len);
-        self.splice_list(result.splice.old.clone(), result.splice.new_len);
+        self.follow_splice(
+            result.splice.old.clone(),
+            result.splice.new_len,
+            result.inner.clone(),
+            result.path == document::Path::TableRow,
+        );
         self.perf
             .borrow_mut()
             .reparsed(result.parsed_bytes, result.path);
@@ -254,6 +277,33 @@ impl VisualView {
             self.marked = None;
         }
         cx.notify();
+    }
+
+    /// Brings the rows and the list up to date with a splice of the blocks.
+    fn follow_splice(
+        &mut self,
+        old: Range<usize>,
+        new_len: usize,
+        inner: Option<Range<usize>>,
+        table_row: bool,
+    ) {
+        // Long tables keep their measured widths across row edits, widened by
+        // the edited rows; any other change to them measures again.
+        for block in &self.doc.blocks[old.start..old.start + new_len] {
+            match (&inner, table_row) {
+                (Some(rows), true) => self
+                    .table_dirty
+                    .entry(block.id)
+                    .or_default()
+                    .extend(rows.clone()),
+                _ => {
+                    self.table_widths.remove(&block.id);
+                    self.table_dirty.remove(&block.id);
+                }
+            }
+        }
+        let (rows, count) = self.rows.splice(&self.doc, old, new_len, inner);
+        self.splice_list(rows, count);
     }
 
     /// `ListState::splice`, keeping the scroll position: the list resets its
@@ -327,7 +377,7 @@ impl VisualView {
             }
         }
         let splice = self.doc.reconcile(fresh.into_blocks(), &self.synced_text);
-        self.splice_list(splice.old, splice.new_len);
+        self.follow_splice(splice.old, splice.new_len, None, false);
         self.background.loading = false;
         self.caret = self.doc.snap(self.caret);
         cx.notify();
@@ -367,11 +417,11 @@ impl VisualView {
 
     fn after_caret_change(&mut self, cx: &mut Context<Self>) {
         self.caret_blink.reset(cx);
-        if let Some((bix, _, _)) = self.doc.locate(self.caret)
-            && !self.reveal_caret_step(bix)
+        if let Some(row) = self.caret_row()
+            && !self.reveal_caret_step(row)
         {
             // Correct with the next frame's layout.
-            self.pending_reveal = Some((bix, 4));
+            self.pending_reveal = Some((row, 4));
         }
         cx.notify();
     }
@@ -471,16 +521,22 @@ impl VisualView {
         cx.notify();
     }
 
+    /// The list row showing the caret.
+    fn caret_row(&self) -> Option<usize> {
+        let (bix, lix, _) = self.doc.locate(self.caret)?;
+        Some(self.rows.row_of(&self.doc, bix, lix))
+    }
+
     /// One step of bringing the caret into view, with this frame's layout.
     /// Returns true when it is in view. The list only knows the heights of
     /// blocks it has measured, so for a far block this first jumps to the
     /// block, then scrolls to the caret line once the block is laid out
     /// (which also works for a caret deep inside a tall block).
-    fn reveal_caret_step(&mut self, bix: usize) -> bool {
+    fn reveal_caret_step(&mut self, row: usize) -> bool {
         let viewport = self.list.viewport_bounds();
         let Some((top, line_height, _)) = self.caret_position() else {
             self.list.scroll_to(ListOffset {
-                item_ix: bix,
+                item_ix: row,
                 offset_in_item: px(0.),
             });
             return false;
@@ -492,9 +548,9 @@ impl VisualView {
         // Anchor the list on the caret's block, offset to the caret line: an
         // anchor is not clamped by the estimated heights of unmeasured blocks,
         // as a relative scroll is.
-        let Some(item) = self.list.bounds_for_item(bix) else {
+        let Some(item) = self.list.bounds_for_item(row) else {
             self.list.scroll_to(ListOffset {
-                item_ix: bix,
+                item_ix: row,
                 offset_in_item: px(0.),
             });
             return false;
@@ -508,7 +564,7 @@ impl VisualView {
         if within >= goal {
             // The block starts above the viewport once the caret is in place.
             self.list.scroll_to(ListOffset {
-                item_ix: bix,
+                item_ix: row,
                 offset_in_item: within - goal,
             });
         } else {
@@ -520,10 +576,10 @@ impl VisualView {
 
     /// Scrolls only when the caret's block is outside the viewport.
     fn reveal_caret_if_hidden(&mut self) {
-        if let Some((bix, _, _)) = self.doc.locate(self.caret)
-            && !self.reveal_caret_step(bix)
+        if let Some(row) = self.caret_row()
+            && !self.reveal_caret_step(row)
         {
-            self.pending_reveal = Some((bix, 4));
+            self.pending_reveal = Some((row, 4));
         }
     }
 
@@ -706,24 +762,149 @@ impl VisualView {
 
     // ----- rendering --------------------------------------------------------
 
-    fn render_block(
+    /// The column widths of a long table rendered in slices: measured once
+    /// over the whole table, then widened by the rows edited since.
+    fn table_widths(
         &mut self,
-        ix: usize,
+        bix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(block) = self.doc.blocks.get(ix) else {
+    ) -> Arc<Vec<f32>> {
+        let block = &self.doc.blocks[bix];
+        let Kind::Table { rows, aligns } = &block.kind else {
+            return Arc::default();
+        };
+        let id = block.id;
+        let table = |rows: Vec<Vec<_>>| Table::new(rows, aligns.clone());
+        let measured = match self.table_widths.get(&id) {
+            Some((count, widths)) if *count == rows.len() => {
+                let dirty = self.table_dirty.remove(&id).unwrap_or_default();
+                if dirty.is_empty() {
+                    return widths.clone();
+                }
+                let mut sample = vec![rows[0].cells.clone()];
+                sample.extend(
+                    dirty
+                        .iter()
+                        .filter_map(|&r| rows.get(r))
+                        .map(|r| r.cells.clone()),
+                );
+                let fresh = table(sample).measure_column_widths(&self.render_cx, window, cx);
+                let mut widths = widths.to_vec();
+                widths.resize(fresh.len().max(widths.len()), 0.);
+                for (w, f) in widths.iter_mut().zip(fresh) {
+                    *w = w.max(f);
+                }
+                widths
+            }
+            _ => {
+                self.table_dirty.remove(&id);
+                table(rows.iter().map(|r| r.cells.clone()).collect()).measure_column_widths(
+                    &self.render_cx,
+                    window,
+                    cx,
+                )
+            }
+        };
+        let count = match &self.doc.blocks[bix].kind {
+            Kind::Table { rows, .. } => rows.len(),
+            _ => 0,
+        };
+        let measured = Arc::new(measured);
+        self.table_widths.insert(id, (count, measured.clone()));
+        measured
+    }
+
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(ix).cloned() else {
             return div().into_any_element();
         };
+        let bix = row.block;
+        if bix >= self.doc.blocks.len() {
+            return div().into_any_element();
+        }
         self.perf.borrow_mut().block_laid_out();
-        let from = ix.saturating_sub(3);
-        let refs: Vec<&BlockNode> = self.doc.blocks[from..=ix].iter().map(|b| &b.node).collect();
+        let from = bix.saturating_sub(3);
+        let refs: Vec<&BlockNode> = self.doc.blocks[from..=bix]
+            .iter()
+            .map(|b| &b.node)
+            .collect();
         let flow =
-            FlowPosition::at(&refs, ix - from, ix + 1 == self.doc.blocks.len()).first(ix == 0);
+            FlowPosition::at(&refs, bix - from, bix + 1 == self.doc.blocks.len()).first(bix == 0);
+        let Some(part) = row.part else {
+            let block = &self.doc.blocks[bix];
+            return div()
+                .w_full()
+                .child(block.node.render_with_id(
+                    ElementId::Integer(block.id),
+                    flow,
+                    &self.render_cx,
+                    window,
+                    cx,
+                ))
+                .into_any_element();
+        };
+        // A slice of a long list or table: no gap between slices.
+        let total = match &self.doc.blocks[bix].kind {
+            Kind::List { items } => items.len(),
+            Kind::Table { rows, .. } => rows.len(),
+            _ => 0,
+        };
+        let mut flow = flow;
+        if part.start > 0 {
+            flow = flow.first(true);
+        }
+        if part.end < total {
+            flow = flow.last(true);
+        }
+        let node = match (&self.doc.blocks[bix].node, &self.doc.blocks[bix].kind) {
+            (
+                BlockNode::List {
+                    children,
+                    ordered,
+                    start,
+                    ..
+                },
+                _,
+            ) => BlockNode::List {
+                children: children[part.clone()].to_vec(),
+                ordered: *ordered,
+                start: if *ordered {
+                    Some(start.unwrap_or(1) + part.start as u32)
+                } else {
+                    *start
+                },
+                span: None,
+            },
+            (_, Kind::Table { .. }) => {
+                let widths = self.table_widths(bix, window, cx);
+                let Kind::Table { rows, aligns } = &self.doc.blocks[bix].kind else {
+                    return div().into_any_element();
+                };
+                BlockNode::Table(
+                    Table::new(
+                        rows[part.clone()].iter().map(|r| r.cells.clone()).collect(),
+                        aligns.clone(),
+                    )
+                    .chunk(
+                        part.start == 0,
+                        part.start == 0,
+                        part.end == total,
+                        widths,
+                    ),
+                )
+            }
+            _ => self.doc.blocks[bix].node.clone(),
+        };
+        let id = self.doc.blocks[bix].id;
+        // GPUI Kit spaces list items after the first by a quarter of the
+        // body size; a slice that continues a list keeps that spacing.
+        let continues_list = part.start > 0 && matches!(node, BlockNode::List { .. });
         div()
             .w_full()
-            .child(block.node.render_with_id(
-                ElementId::Integer(block.id),
+            .when(continues_list, |row| row.pt(px(BODY_SIZE * 0.25)))
+            .child(node.render_with_id(
+                ElementId::Integer((id << 20) | part.start as u64),
                 flow,
                 &self.render_cx,
                 window,
@@ -841,7 +1022,7 @@ impl Render for VisualView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.perf.borrow_mut().frame_begin();
         let theme = cx.theme();
-        let list = list(self.list.clone(), cx.processor(Self::render_block))
+        let list = list(self.list.clone(), cx.processor(Self::render_row))
             .w_full()
             .h_full();
         let loading = self.background.loading.then(|| {
