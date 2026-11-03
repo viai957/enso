@@ -176,6 +176,9 @@ pub struct EditResult {
     pub parsed_bytes: usize,
     /// The result is provisional: a whole-document parse must reconcile it.
     pub needs_full: bool,
+    /// For an edit inside one list or table: the items or rows (of the new
+    /// block) it changed.
+    pub inner: Option<Range<usize>>,
 }
 
 #[derive(Default)]
@@ -618,6 +621,7 @@ impl VisualDocument {
                     path: Path::Isolated,
                     parsed_bytes: window.len(),
                     needs_full: false,
+                    inner: None,
                 };
             }
         }
@@ -675,6 +679,7 @@ impl VisualDocument {
                     path: Path::Neighbours,
                     parsed_bytes: window.len(),
                     needs_full: false,
+                    inner: None,
                 };
             }
             provisional = Some((parsed, lo..hi, window.len()));
@@ -718,6 +723,7 @@ impl VisualDocument {
             path: Path::Provisional,
             parsed_bytes: bytes,
             needs_full: true,
+            inner: None,
         }
     }
 
@@ -821,6 +827,7 @@ impl VisualDocument {
             },
             parsed_bytes: 0,
             needs_full: provisional,
+            inner: None,
         })
     }
 
@@ -980,6 +987,7 @@ impl VisualDocument {
             path: Path::ListItem,
             parsed_bytes,
             needs_full: false,
+            inner: Some(lo..hi),
         })
     }
 
@@ -1090,6 +1098,7 @@ impl VisualDocument {
             path: Path::TableRow,
             parsed_bytes,
             needs_full: false,
+            inner: Some(r..r + 1),
         })
     }
 
