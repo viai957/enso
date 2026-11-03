@@ -5,6 +5,7 @@ mod markdown_edit;
 mod onboarding;
 mod reader;
 mod settings;
+mod shell_perf;
 mod stats;
 #[allow(dead_code)]
 mod visual;
@@ -1494,6 +1495,20 @@ impl Enso {
 
 impl Render for Enso {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let started = shell_perf::enabled().then(std::time::Instant::now);
+        let shell = self.render_shell(window, cx).into_any_element();
+        match started {
+            Some(started) => {
+                shell_perf::ShellProbe::new(shell, started.elapsed()).into_any_element()
+            }
+            None => shell,
+        }
+    }
+}
+
+impl Enso {
+    fn render_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        shell_perf::count("shell");
         if self.focus_after_close {
             self.focus_after_close = false;
             let focus = self
