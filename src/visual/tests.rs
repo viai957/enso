@@ -437,3 +437,67 @@ fn open_parses_a_prefix_then_the_rest_in_the_background(cx: &mut TestAppContext)
         assert_eq!(v.doc.blocks.len(), 3000);
     });
 }
+
+/// A caret deep inside a block taller than the viewport is brought into view,
+/// and typing there does not move the view.
+#[gpui_kit::test]
+fn caret_deep_in_a_tall_block_is_revealed_and_typing_keeps_the_view(cx: &mut TestAppContext) {
+    let paras: String = (0..40).map(|i| format!("Paragraph {i}.\n\n")).collect();
+    let code: String = (0..300).map(|i| format!("line {i}\n")).collect();
+    let text = format!("{paras}```\n{code}```\n\n{paras}");
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        super::view::init(cx);
+    });
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Default::default(),
+                    size: size(px(800.), px(600.)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let editor = cx.new(|cx| EditorState::new(window, cx).default_value(text.clone()));
+                let view = cx.new(|cx| VisualView::new(editor, window, cx));
+                view.update(cx, |v, cx| window.focus(&v.focus, cx));
+                view
+            },
+        )
+        .unwrap()
+    });
+    draw(cx, handle);
+    let at = text.find("line 250").unwrap();
+    cx.update(|cx| view.update(cx, |v, _| v.caret = at));
+    cx.simulate_input(handle, "x");
+    for _ in 0..4 {
+        draw(cx, handle);
+    }
+    let visible = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let v = view.read(cx);
+            let viewport = v.list.viewport_bounds();
+            let (top, h, _) = v.caret_position().expect("caret laid out");
+            eprintln!(
+                "caret {:?} viewport {:?} scroll {:?}",
+                top.y,
+                viewport,
+                v.list.logical_scroll_top()
+            );
+            top.y >= viewport.top() && top.y + h <= viewport.bottom()
+        })
+    };
+    assert!(visible(cx), "caret revealed");
+    let before = cx.update(|cx| view.read(cx).caret_position().unwrap().0.y);
+    for _ in 0..5 {
+        cx.simulate_input(handle, "y");
+        draw(cx, handle);
+    }
+    let after = cx.update(|cx| view.read(cx).caret_position().unwrap().0.y);
+    assert!(
+        (after - before).abs() < px(1.),
+        "the view stays put while typing: {before:?} → {after:?}"
+    );
+}

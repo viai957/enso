@@ -115,6 +115,10 @@ pub struct VisualView {
     pub geometry: Rc<RefCell<HashMap<u64, LeafGeometry>>>,
     /// A vertical move waiting for the scroll that brings its target in.
     pending_vertical: Option<bool>,
+    /// A block to bring into view, retried after layout: the list estimates
+    /// the heights of blocks it has not measured, so one reveal can land
+    /// short of a far block.
+    pending_reveal: Option<(usize, u8)>,
     pub focus: FocusHandle,
     pub perf: Rc<RefCell<Perf>>,
     pub caret_blink: Caret,
@@ -161,6 +165,7 @@ impl VisualView {
             marked: None,
             geometry: Rc::default(),
             pending_vertical: None,
+            pending_reveal: None,
             focus: cx.focus_handle(),
             perf: Rc::new(RefCell::new(Perf::from_env())),
             caret_blink: Caret::new(cx),
@@ -219,8 +224,7 @@ impl VisualView {
             return;
         };
         let result = self.doc.edit(&self.synced_text, old.clone(), new_len);
-        self.list
-            .splice(result.splice.old.clone(), result.splice.new_len);
+        self.splice_list(result.splice.old.clone(), result.splice.new_len);
         self.perf
             .borrow_mut()
             .reparsed(result.parsed_bytes, result.path);
@@ -250,6 +254,21 @@ impl VisualView {
             self.marked = None;
         }
         cx.notify();
+    }
+
+    /// `ListState::splice`, keeping the scroll position: the list resets its
+    /// anchor to the top of a replaced item, which would jump the view to the
+    /// start of a tall block on every keystroke inside it.
+    fn splice_list(&mut self, old: Range<usize>, new_len: usize) {
+        let top = self.list.logical_scroll_top();
+        self.list.splice(old.clone(), new_len);
+        if old.contains(&top.item_ix) && new_len > 0 {
+            let item_ix = top.item_ix.min(old.start + new_len - 1);
+            self.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: top.offset_in_item,
+            });
+        }
     }
 
     /// Starts a whole-document parse of the current text on a background
@@ -308,7 +327,7 @@ impl VisualView {
             }
         }
         let splice = self.doc.reconcile(fresh.into_blocks(), &self.synced_text);
-        self.list.splice(splice.old, splice.new_len);
+        self.splice_list(splice.old, splice.new_len);
         self.background.loading = false;
         self.caret = self.doc.snap(self.caret);
         cx.notify();
@@ -348,13 +367,18 @@ impl VisualView {
 
     fn after_caret_change(&mut self, cx: &mut Context<Self>) {
         self.caret_blink.reset(cx);
-        if let Some((bix, _, _)) = self.doc.locate(self.caret) {
-            self.list.scroll_to_reveal_item(bix);
+        if let Some((bix, _, _)) = self.doc.locate(self.caret)
+            && !self.reveal_caret_step(bix)
+        {
+            // Correct with the next frame's layout.
+            self.pending_reveal = Some((bix, 4));
         }
         cx.notify();
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // A bound key runs its action instead of the key-down listeners.
+        self.perf.borrow_mut().input();
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -380,6 +404,7 @@ impl VisualView {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -394,6 +419,7 @@ impl VisualView {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         let in_code = self
             .doc
             .locate(self.caret)
@@ -412,6 +438,7 @@ impl VisualView {
     /// the scroll position the edit was made at when it made it, and
     /// otherwise keeps the restored caret in view.
     pub fn replay(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         self.marked = None;
         self.editor.update(cx, |state, cx| {
             if undo {
@@ -433,6 +460,9 @@ impl VisualView {
                 .map(|(_, offset)| *offset)
                 .map(|offset| self.list.scroll_to(offset))
                 .is_some();
+        if restored {
+            self.pending_reveal = None;
+        }
         self.caret_blink.reset(cx);
         if !restored {
             self.reveal_caret_if_hidden();
@@ -441,19 +471,66 @@ impl VisualView {
         cx.notify();
     }
 
+    /// One step of bringing the caret into view, with this frame's layout.
+    /// Returns true when it is in view. The list only knows the heights of
+    /// blocks it has measured, so for a far block this first jumps to the
+    /// block, then scrolls to the caret line once the block is laid out
+    /// (which also works for a caret deep inside a tall block).
+    fn reveal_caret_step(&mut self, bix: usize) -> bool {
+        let viewport = self.list.viewport_bounds();
+        let Some((top, line_height, _)) = self.caret_position() else {
+            self.list.scroll_to(ListOffset {
+                item_ix: bix,
+                offset_in_item: px(0.),
+            });
+            return false;
+        };
+        let margin = line_height.min(viewport.size.height / 4.);
+        if top.y >= viewport.top() + margin && top.y + line_height <= viewport.bottom() - margin {
+            return true;
+        }
+        // Anchor the list on the caret's block, offset to the caret line: an
+        // anchor is not clamped by the estimated heights of unmeasured blocks,
+        // as a relative scroll is.
+        let Some(item) = self.list.bounds_for_item(bix) else {
+            self.list.scroll_to(ListOffset {
+                item_ix: bix,
+                offset_in_item: px(0.),
+            });
+            return false;
+        };
+        let within = top.y - item.top();
+        let goal = if top.y < viewport.top() + margin {
+            margin
+        } else {
+            viewport.size.height - margin - line_height
+        };
+        if within >= goal {
+            // The block starts above the viewport once the caret is in place.
+            self.list.scroll_to(ListOffset {
+                item_ix: bix,
+                offset_in_item: within - goal,
+            });
+        } else {
+            // The block's top stays in view: scroll by the difference.
+            self.list.scroll_by(top.y - (viewport.top() + goal));
+        }
+        false
+    }
+
     /// Scrolls only when the caret's block is outside the viewport.
     fn reveal_caret_if_hidden(&mut self) {
         if let Some((bix, _, _)) = self.doc.locate(self.caret)
-            && (self.list.item_is_above_viewport(bix) != Some(false)
-                || self.list.item_is_below_viewport(bix) != Some(false))
+            && !self.reveal_caret_step(bix)
         {
-            self.list.scroll_to_reveal_item(bix);
+            self.pending_reveal = Some((bix, 4));
         }
     }
 
     // ----- caret movement -------------------------------------------------
 
     fn move_horizontal(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         let Some((bix, lix, index)) = self.doc.locate(self.caret) else {
             return;
         };
@@ -543,6 +620,7 @@ impl VisualView {
     }
 
     fn move_vertical(&mut self, down: bool, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         if self.try_vertical(down) {
             self.pending_vertical = None;
             self.caret_blink.reset(cx);
@@ -556,6 +634,7 @@ impl VisualView {
     }
 
     fn line_edge(&mut self, end: bool, cx: &mut Context<Self>) {
+        self.perf.borrow_mut().input();
         let Some((top, line_height, _)) = self.caret_position() else {
             return;
         };
@@ -870,6 +949,13 @@ impl Element for Surface {
         let (_, geometry) = collect_leaf_geometry(decorations, || child.prepaint(window, cx));
         self.view.update(cx, |view, cx| {
             *view.geometry.borrow_mut() = geometry;
+            if let Some((bix, tries)) = view.pending_reveal.take()
+                && tries > 0
+                && !view.reveal_caret_step(bix)
+            {
+                view.pending_reveal = Some((bix, tries - 1));
+                cx.notify();
+            }
             if let Some(down) = view.pending_vertical.take() {
                 if !view.try_vertical(down) {
                     view.pending_vertical = Some(down);
