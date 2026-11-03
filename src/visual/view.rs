@@ -65,6 +65,8 @@ pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
 /// The page's body text size (placeholder token until the design reference
 /// sets it).
 pub const BODY_SIZE: f32 = 17.;
+/// The page's margin above its first line.
+pub const PAGE_TOP: f32 = 28.;
 
 /// How long typing must pause before the background whole parse that
 /// settles the index runs.
@@ -1295,7 +1297,8 @@ impl Render for VisualView {
         let theme = cx.theme();
         let list = list(self.list.clone(), cx.processor(Self::render_row))
             .w_full()
-            .h_full();
+            .flex_1()
+            .min_h_0();
         let loading = self.background.loading.then(|| {
             // A quiet note while the rest of a long file parses.
             div()
@@ -1309,11 +1312,19 @@ impl Render for VisualView {
                 .text_color(theme.muted_foreground)
                 .child("Preparing the rest of the document…")
         });
-        let page = div()
-            .size_full()
-            .flex()
-            .justify_center()
-            .child(div().w(px(680.)).max_w_full().h_full().px_4().child(list));
+        let page = div().size_full().flex().justify_center().child(
+            // A margin above the page's first line; the list scrolls
+            // under nothing (the margin is outside it).
+            div()
+                .w(px(680.))
+                .max_w_full()
+                .h_full()
+                .px_4()
+                .pt(px(PAGE_TOP))
+                .flex()
+                .flex_col()
+                .child(list),
+        );
         let root = div()
             .id("visual-editor")
             .key_context(CONTEXT)

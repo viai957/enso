@@ -650,7 +650,7 @@ fn reference_definitions_update_every_link(cx: &mut TestAppContext) {
         })
     };
     let secondary = cx.update(|cx| gpui_kit::Modifiers::secondary_key(cx));
-    let mut follow = |cx: &mut TestAppContext, word: &str| {
+    let follow = |cx: &mut TestAppContext, word: &str| {
         let at = link_point(cx, word);
         click(cx, handle, at, 1, secondary);
         draw(cx, handle);
