@@ -69,9 +69,11 @@ While you type, the sidebar, tabs and status bar fade away and return as soon as
 
 ## Images
 
-Images sit in the page at their natural size, up to the width of the column. Click one to select it: drag the handle to resize it, align it left, centre or float it right, or open the image dialog to change its file, description and width. ⌘⇧I inserts a new image from a file or a URL, and pasting a screenshot saves it next to your notes.
+Images sit in the page at their natural size, up to the width of the column. Click one to select it: drag the handle to resize it, float it left or right, centre it, or double-click it to open the image dialog. ⌘⇧I inserts a new image from a file or a URL, and pasting a screenshot saves it next to your notes.
 
-enso writes a plain Markdown image whenever it can, and an HTML `<img>` tag only when a size or alignment needs one. The dialog tells you which it will write.
+The dialog shows a preview with the image's natural size. You can drop a file onto the preview or browse for one, and write the description that screen readers read aloud. Set the width and height in pixels or as a percentage, add spacing around the image, and choose its alignment. Turn on **Inline** to place the image inside a sentence, like a badge. With the caret on an inline image, ⌘⇧I edits it in place.
+
+enso writes a plain Markdown image whenever it can, and an HTML `<img>` tag only when a size, spacing or alignment needs one. The dialog tells you which it will write.
 
 <p align="center"><img src="assets/screenshots/image-light.png" alt="A selected image with its toolbar and resize handle" width="880"></p>
 

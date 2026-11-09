@@ -748,10 +748,6 @@ impl VisualView {
                 .max_w_full()
                 .object_fit(ObjectFit::Contain)
                 .rounded(tokens::RADIUS_MD)
-                .shadow(crate::glass::shadows(
-                    crate::glass::Depth::Bar,
-                    theme.is_dark(),
-                ))
                 .with_fallback(move || {
                     div()
                         .px_3()
