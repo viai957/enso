@@ -119,7 +119,7 @@ impl<'a> Builder<'a> {
                     &image.url,
                     &image.alt,
                     &image.title,
-                    image.width,
+                    (image.width, image.height, image.hspace, image.vspace),
                     image.align as u8,
                 ));
                 self.kind = Kind::Image(image);
@@ -138,7 +138,7 @@ impl<'a> Builder<'a> {
                     &image.url,
                     &image.alt,
                     &image.title,
-                    image.width,
+                    (image.width, image.height, image.hspace, image.vspace),
                     image.align as u8,
                 ));
                 self.kind = Kind::Image(image);

@@ -960,7 +960,7 @@ fn image_blocks_resize_align_and_delete_in_place(cx: &mut TestAppContext) {
     });
     assert_eq!(images.len(), 2, "{images:?}");
     assert_eq!(images[0].1.url, "ridge.png");
-    assert_eq!(images[1].1.width, Some(300));
+    assert_eq!(images[1].1.width, Some(super::image::Length::Px(300)));
     assert_eq!(images[1].1.align, super::image::ImageAlign::Center);
     let first = images[0].0;
     cx.update_window(handle, |_, window, cx| {
@@ -999,6 +999,74 @@ fn image_blocks_resize_align_and_delete_in_place(cx: &mut TestAppContext) {
     assert!(!text.contains("ridge.png"), "{text}");
     assert!(text.starts_with("Before.\n\n<p align"), "{text}");
     assert_synced(cx, &view, "after removing an image");
+}
+
+#[gpui_kit::test]
+fn the_image_dialog_edits_inline_images_and_spacing(cx: &mut TestAppContext) {
+    let doc = "Badges ![chat](chat.svg) here.\n\n![Ridge](ridge.png)\n";
+    let (handle, view) = open(cx, doc);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.caret = 9;
+            v.insert_image_dialog(window, cx);
+            let dialog = v.image_dialog.as_ref().unwrap();
+            assert_eq!(dialog.target, super::image_ui::ImageTarget::Inline(7..24));
+            assert!(dialog.inline);
+            dialog
+                .height
+                .update(cx, |s, cx| s.set_value("20", window, cx));
+            v.confirm_image_dialog(window, cx);
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    assert_eq!(
+        source(cx, &view),
+        "Badges <img src=\"chat.svg\" alt=\"chat\" height=\"20\"> here.\n\n![Ridge](ridge.png)\n"
+    );
+    let ridge = cx.update(|cx| {
+        view.read(cx)
+            .doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, super::document::Kind::Image(_)))
+            .map(|b| b.id)
+            .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_image(Some(ridge), cx);
+            v.insert_image_dialog(window, cx);
+            let dialog = v.image_dialog.as_mut().unwrap();
+            assert!(!dialog.can_inline());
+            dialog.align = super::image::ImageAlign::Left;
+            let (w, h) = (dialog.width.clone(), dialog.hspace.clone());
+            w.update(cx, |s, cx| s.set_value("40%", window, cx));
+            h.update(cx, |s, cx| s.set_value("12", window, cx));
+            v.confirm_image_dialog(window, cx);
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    let text = source(cx, &view);
+    assert!(
+        text.ends_with(
+            "<img src=\"ridge.png\" alt=\"Ridge\" width=\"40%\" hspace=\"12\" align=\"left\">\n"
+        ),
+        "{text}"
+    );
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_image(None, cx);
+            v.caret = 9;
+            v.insert_image_dialog(window, cx);
+            v.delete_dialog_image(window, cx);
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    assert!(source(cx, &view).starts_with("Badges  here."));
+    assert_synced(cx, &view, "after editing images in the dialog");
 }
 
 #[gpui_kit::test]

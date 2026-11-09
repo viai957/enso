@@ -1854,7 +1854,7 @@ impl Render for VisualView {
             .children(guide)
             .children(empty)
             .children(self.render_table_toolbar(window, cx))
-            .children(self.render_image_dialog(cx))
+            .children(self.render_image_dialog(window, cx))
             .children(self.render_math_dialog(window, cx))
             .children(loading)
             .children(self.perf_overlay(cx))
