@@ -8,18 +8,12 @@ use gpui_kit::*;
 use crate::tokens;
 
 pub fn floating_toolbar(id: &'static str, cx: &App) -> Stateful<Div> {
-    let theme = cx.theme();
-    div()
+    crate::glass::surface(div(), crate::glass::Depth::Bar, cx)
         .id(id)
         .flex()
         .items_center()
         .gap_0p5()
-        .p_0p5()
-        .rounded_md()
-        .bg(theme.popover)
-        .border_1()
-        .border_color(theme.border)
-        .shadow_md()
+        .p_1()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 

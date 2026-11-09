@@ -1,3 +1,5 @@
+#[path = "../src/glass.rs"]
+mod glass;
 #[path = "../src/markdown_edit.rs"]
 #[allow(dead_code)]
 mod markdown_edit;

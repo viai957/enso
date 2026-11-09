@@ -1,6 +1,7 @@
 mod app_icon;
 mod brand;
 mod files;
+mod glass;
 mod markdown_edit;
 mod onboarding;
 mod reader;
