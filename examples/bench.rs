@@ -3,6 +3,9 @@ mod glass;
 #[path = "../src/markdown_edit.rs"]
 #[allow(dead_code)]
 mod markdown_edit;
+#[path = "../src/sheet/mod.rs"]
+#[allow(dead_code)]
+mod sheet;
 #[path = "../src/tokens.rs"]
 #[allow(dead_code)]
 mod tokens;

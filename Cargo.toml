@@ -17,6 +17,7 @@ typst-render = "0.15.1"
 mitex = "0.2.4"
 typst-assets = { version = "0.15.1", features = ["fonts"] }
 typst-layout = "0.15.1"
+ironcalc_base = "=0.9.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 smallvec = "1"
 

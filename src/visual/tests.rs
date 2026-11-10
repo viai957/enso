@@ -1070,6 +1070,37 @@ fn the_image_dialog_edits_inline_images_and_spacing(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn table_formulas_show_results_until_the_caret_enters(cx: &mut TestAppContext) {
+    let doc = "| a | b |\n|---|---|\n| 2 | 3 |\n| =A2*B2 | =SUM(A2:B2) |\n";
+    let (handle, view) = open(cx, doc);
+    let texts = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let v = view.read(cx);
+            let bix = v
+                .doc
+                .blocks
+                .iter()
+                .position(|b| matches!(b.kind, super::document::Kind::Table { .. }))
+                .unwrap();
+            v.computed_cells(bix, 2..3, cx)[0]
+                .iter()
+                .map(|p| {
+                    p.children()
+                        .iter()
+                        .map(|n| n.text().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(texts(cx), vec!["6", "5"]);
+    cx.update(|cx| view.update(cx, |v, _| v.caret = doc.find("=SUM").unwrap() + 2));
+    draw(cx, handle);
+    assert_eq!(texts(cx), vec!["6", "=SUM(A2:B2)"]);
+    assert_eq!(source(cx, &view), doc);
+}
+
+#[gpui_kit::test]
 fn pasting_an_image_inserts_an_image_block(cx: &mut TestAppContext) {
     let doc = "First paragraph.\n\nSecond.\n";
     let (handle, view) = open(cx, doc);

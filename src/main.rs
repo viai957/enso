@@ -6,6 +6,7 @@ mod markdown_edit;
 mod onboarding;
 mod reader;
 mod settings;
+mod sheet;
 mod shell_perf;
 mod stats;
 mod text_rendering;

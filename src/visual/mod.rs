@@ -13,6 +13,7 @@ mod math_ui;
 pub mod perf;
 pub mod prefs;
 pub mod rows;
+mod table_calc;
 mod table_edit;
 mod table_ui;
 #[cfg(all(test, feature = "ui-tests"))]

@@ -200,6 +200,8 @@ pub struct VisualView {
     pub rows: Rows,
     table_widths: HashMap<u64, (usize, Arc<Vec<f32>>)>,
     table_dirty: HashMap<u64, Vec<usize>>,
+    pub table_calc: std::cell::RefCell<HashMap<u64, (u64, super::table_calc::Values)>>,
+    pub formula_keys: std::cell::RefCell<std::collections::HashSet<u64>>,
     _observe: Subscription,
     _prefs: Subscription,
 }
@@ -274,6 +276,8 @@ impl VisualView {
             rows,
             table_widths: HashMap::new(),
             table_dirty: HashMap::new(),
+            table_calc: Default::default(),
+            formula_keys: Default::default(),
             _observe: observe,
             _prefs: prefs,
         };
@@ -1305,6 +1309,9 @@ impl VisualView {
         })?;
         let (bix, lix) = self.doc.leaf_by_key(key)?;
         let text = &self.doc.blocks[bix].leaves[lix].text;
+        if self.formula_keys.borrow().contains(&key) {
+            return Some(self.doc.src_of(bix, lix, text.len()));
+        }
         let index = g.index_for_position(at);
         if index > text.len() || !text.is_char_boundary(index) {
             return Some(self.doc.src_of(bix, lix, index));
@@ -1522,6 +1529,25 @@ impl VisualView {
         }
         let Some(part) = row.part else {
             let block = &self.doc.blocks[bix];
+            if let Kind::Table { rows, aligns } = &block.kind
+                && self.table_values(bix, cx).is_some()
+            {
+                let (count, aligns, id) = (rows.len(), aligns.clone(), block.id);
+                let node =
+                    BlockNode::Table(Table::new(self.computed_cells(bix, 0..count, cx), aligns));
+                return div()
+                    .w_full()
+                    .pt(pad_top)
+                    .pb(pad_bottom)
+                    .child(node.render_with_id(
+                        ElementId::Integer(id),
+                        flow,
+                        &self.render_cx,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element();
+            }
             return div()
                 .w_full()
                 .pt(pad_top)
@@ -1568,15 +1594,12 @@ impl VisualView {
             },
             (_, Kind::Table { .. }) => {
                 let widths = self.table_widths(bix, part.clone(), window, cx);
-                let Kind::Table { rows, aligns } = &self.doc.blocks[bix].kind else {
+                let Kind::Table { aligns, .. } = &self.doc.blocks[bix].kind else {
                     return div().into_any_element();
                 };
+                let aligns = aligns.clone();
                 BlockNode::Table(
-                    Table::new(
-                        rows[part.clone()].iter().map(|r| r.cells.clone()).collect(),
-                        aligns.clone(),
-                    )
-                    .chunk(
+                    Table::new(self.computed_cells(bix, part.clone(), cx), aligns).chunk(
                         part.start == 0,
                         part.start == 0,
                         part.end == total,
@@ -1644,6 +1667,9 @@ impl VisualView {
             out.entry(key)
                 .or_default()
                 .push((s..e.max(s), cx.theme().selection));
+        }
+        for key in self.formula_keys.borrow().iter() {
+            out.remove(key);
         }
         out
     }

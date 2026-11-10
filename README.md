@@ -31,7 +31,7 @@ Windows on ARM, ARM Linux, portable Windows zips and older versions are on the [
 
 ## Write in the page
 
-Open any Markdown file and you see it typeset: headings, emphasis, lists, task lists, quotes, tables, code blocks, links and images. Click anywhere and type. There's no preview pane: the page you read is the page you edit, and the Markdown behind it changes only where you typed.
+Open any Markdown file and you see it typeset: headings, emphasis, lists, task lists, quotes, tables, code blocks with syntax highlighting for common languages and many uncommon ones, links and images. Click anywhere and type. There's no preview pane: the page you read is the page you edit, and the Markdown behind it changes only where you typed.
 
 - **Selection that feels native:** drag across blocks with edge autoscroll, double-click for a word, triple-click for a paragraph, Shift-click or Shift-arrows to extend.
 - **Copy as Markdown:** the clipboard gets the exact source behind your selection, so pasting into another Markdown file round-trips.
@@ -84,6 +84,10 @@ enso writes a plain Markdown image whenever it can, and an HTML `<img>` tag only
 Click into a table and edit cells directly, including bold, links and code. Tab and Shift-Tab move between cells, and Tab on the last cell starts a new row. A small toolbar adds and removes rows and columns and tidies the column padding in the Markdown, all without moving the table.
 
 <p align="center"><img src="assets/screenshots/table-light.png" alt="Editing a table with its toolbar" width="880"></p>
+
+Tables also calculate. Start a cell with `=` and write a spreadsheet formula, like `=SUM(D2:D4)`, `=B2*C2` or `=AVERAGE(D2:D4)`. Columns are lettered from A and rows are numbered from the header, just as the table looks. The cell shows the result and updates as you type. Click into it to see and edit the formula. Currency and number formats carry through, and errors like `#DIV/0!` are tinted so they stand out. The file keeps the formula, so the Markdown stays plain text. The [IronCalc](https://github.com/ironcalc/IronCalc) engine does the calculating.
+
+<p align="center"><img src="assets/screenshots/table-formulas-light.png" alt="A table whose totals are calculated by formulas" width="880"></p>
 
 ## Math
 
