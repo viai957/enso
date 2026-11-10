@@ -1,5 +1,8 @@
 #[path = "../src/glass.rs"]
 mod glass;
+#[path = "../src/hdr_caret.rs"]
+#[allow(dead_code)]
+mod hdr_caret;
 #[path = "../src/markdown_edit.rs"]
 #[allow(dead_code)]
 mod markdown_edit;

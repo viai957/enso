@@ -2,6 +2,7 @@ mod app_icon;
 mod brand;
 mod files;
 mod glass;
+mod hdr_caret;
 mod markdown_edit;
 mod onboarding;
 mod reader;
@@ -464,6 +465,7 @@ impl Enso {
     }
 
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        crate::hdr_caret::hide(window);
         let Some(index) = self.active else {
             return;
         };

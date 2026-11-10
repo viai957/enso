@@ -1993,6 +1993,14 @@ impl Element for Surface {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 window.paint_quad(fill(caret, color));
             });
+            let visible = caret.intersect(&bounds);
+            if prefs.hdr_caret && visible.size == caret.size {
+                crate::hdr_caret::show(window, caret, color);
+            } else {
+                crate::hdr_caret::hide(window);
+            }
+        } else {
+            crate::hdr_caret::hide(window);
         }
         let perf = view.perf.clone();
         let focus = view.focus.clone();

@@ -112,7 +112,7 @@ YAML and TOML front matter opens in its own panel above the page, with syntax hi
 
 ## Make it yours
 
-Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. Light and dark themes follow the system, or pick one yourself. On macOS, text is drawn crisply, the way current Mac apps draw it; Settings › Appearance can switch back to the heavier, older style.
+Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. On a Mac with an HDR display, turn on **HDR glow** in Settings › Caret and the caret shines brighter than white, using the display's extra brightness headroom. On other displays, and when the screen has no headroom left at full brightness, it stays a normal caret. Light and dark themes follow the system, or pick one yourself. On macOS, text is drawn crisply, the way current Mac apps draw it; Settings › Appearance can switch back to the heavier, older style.
 
 <p align="center">
   <img src="assets/screenshots/settings-writing-light.png" alt="Writing settings" width="430">

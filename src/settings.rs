@@ -661,6 +661,7 @@ impl SettingsWindow {
         let width = self.writing_setter(cx, |p, w: u32| p.caret_width = w as f32);
         let blink = self.writing_setter(cx, |p, on: bool| p.caret_blink = on);
         let rate = self.writing_setter(cx, |p, ms: u32| p.blink_period_ms = ms);
+        let hdr = self.writing_setter(cx, |p, on: bool| p.hdr_caret = on);
         let cell = self.writing_setter(cx, |p, i: u32| {
             let flipped = p.blink_pattern ^ (1 << i);
             if flipped != 0 {
@@ -769,7 +770,18 @@ impl SettingsWindow {
                         "One blink in twelve steps: filled steps show the caret.",
                         pattern,
                         &theme,
-                    )),
+                    ))
+                    .when(crate::hdr_caret::supported(), |rows| {
+                        rows.child(setting_row(
+                            "HDR glow",
+                            "On a display with HDR headroom, the caret shines brighter than white.",
+                            Switch::new("caret-hdr")
+                                .checked(prefs.hdr_caret)
+                                .accessibility_label("HDR caret")
+                                .on_change(move |on, _, cx| hdr(*on, cx)),
+                            &theme,
+                        ))
+                    }),
             )
     }
 

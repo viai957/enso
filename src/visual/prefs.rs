@@ -61,6 +61,7 @@ pub struct WritingPrefs {
     pub text_size: f32,
     pub hide_chrome: bool,
     pub crisp_text: bool,
+    pub hdr_caret: bool,
 }
 
 impl Default for WritingPrefs {
@@ -77,6 +78,7 @@ impl Default for WritingPrefs {
             text_size: 17.,
             hide_chrome: true,
             crisp_text: true,
+            hdr_caret: false,
         }
     }
 }
@@ -107,7 +109,7 @@ impl WritingPrefs {
             CaretColor::Custom(value) => format!("#{value:06x}"),
         };
         format!(
-            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\ntext_size = {}\nhide_chrome = {}\ncrisp_text = {}\n",
+            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\ntext_size = {}\nhide_chrome = {}\ncrisp_text = {}\nhdr_caret = {}\n",
             self.caret_width,
             self.caret_blink,
             self.blink_period_ms,
@@ -118,6 +120,7 @@ impl WritingPrefs {
             self.text_size,
             self.hide_chrome,
             self.crisp_text,
+            self.hdr_caret,
         )
     }
 
@@ -167,6 +170,7 @@ impl WritingPrefs {
                 "focus" => prefs.focus = FocusMode::parse(value),
                 "hide_chrome" => prefs.hide_chrome = value != "false",
                 "crisp_text" => prefs.crisp_text = value != "false",
+                "hdr_caret" => prefs.hdr_caret = value == "true",
                 "text_size" => {
                     if let Ok(v) = value.parse::<f32>() {
                         prefs.text_size = v.clamp(MIN_TEXT, MAX_TEXT);
@@ -197,6 +201,7 @@ mod tests {
             text_size: 19.,
             hide_chrome: false,
             crisp_text: false,
+            hdr_caret: true,
         };
         assert_eq!(WritingPrefs::parse(&prefs.serialize()), prefs);
         let odd = WritingPrefs::parse("caret_width = 99\nblink_pattern = 0\nfocus = ??\nnoise\n");

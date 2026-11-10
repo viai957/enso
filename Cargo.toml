@@ -34,9 +34,14 @@ trash = "5"
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSResponder", "NSView", "NSWindow", "NSScreen", "objc2-quartz-core", "objc2-core-foundation"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSBundle", "NSData", "NSString", "NSUserDefaults"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes", "CFString"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGColorSpace"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLRenderCommandEncoder", "MTLRenderPass", "MTLPixelFormat", "MTLDrawable", "MTLTexture", "MTLResource", "MTLAllocation"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAMetalLayer", "CATransaction", "objc2-metal", "objc2-core-foundation", "objc2-core-graphics"] }
 
 [profile.dev]
 debug = 0
